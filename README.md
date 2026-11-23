@@ -46,7 +46,7 @@ Do not share the private editor authentication token.
 
 This edition is built from the v0.3.8 standard map as a **patch-based Java + browser frontend** distribution (not a complete upstream source rewrite). The build project requires a matching compiled `base.jar`, Java 21, and the included compile dependencies. [Read the rebuild guide](BUILDING.md).
 
-See [v0.3.9-square release](../../releases/tag/v0.3.9-square) when published, for the precise edition JAR and separately bundled source.
+Download [Square Edition v0.3.9](../../releases/tag/v0.3.9-square): [JAR](../../releases/download/v0.3.9-square/MilzzyNodesMap-0.3.9-Square.jar) and [matching source ZIP](../../releases/download/v0.3.9-square/MilzzyNodesMap-0.3.9-Square-Source.zip).
 
 ## Related projects
 
