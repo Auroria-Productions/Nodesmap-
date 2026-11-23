@@ -37,7 +37,7 @@ MilzzyNodesMap is a Paper plugin that provides an independent browser map for **
 
 1. Back up your existing `plugins/milzzynodesmap/` folder and the Nodes `world.json`.
 2. Stop your Minecraft server and remove the **old map JAR**, avoiding duplicates.
-3. Download the appropriate edition's `milzzynodesmap.jar` release asset (when available) and place it under `plugins/`.
+3. Download your preferred edition's JAR from the [standard release](../../releases/tag/v0.3.8-standard) or [Square Edition release](../../releases/tag/v0.3.9-square) and place it under `plugins/`.
 4. Leave your running compatible `milzzynodes.jar` core unchanged.
 5. Configure the web port in `plugins/milzzynodesmap/config.yml` to match your host's extra allocation.
 6. Set `web.update-viewer: true` so that new website resources are installed.
@@ -56,7 +56,7 @@ Edits are not immediately pushed into the live world. Review your changes in the
 
 - [Standard map source (`main`)](../../tree/main)
 - [Square Edition source (`square-map`)](../../tree/square-map)
-- [Releases](../../releases): version-specific plugin JARs and source ZIPs
+- [**Standard v0.3.8 release**](../../releases/tag/v0.3.8-standard): [JAR](../../releases/download/v0.3.8-standard/MilzzyNodesMap-0.3.8-Standard.jar) + [source ZIP](../../releases/download/v0.3.8-standard/MilzzyNodesMap-0.3.8-Standard-Source.zip)\n- [**Square v0.3.9 release**](../../releases/tag/v0.3.9-square): [JAR](../../releases/download/v0.3.9-square/MilzzyNodesMap-0.3.9-Square.jar) + [source ZIP](../../releases/download/v0.3.9-square/MilzzyNodesMap-0.3.9-Square-Source.zip)
 
 These editions share a single `milzzynodesmap` Bukkit plugin ID. Switching editions means **replacing** the JAR and restarting—not loading them side by side.
 
