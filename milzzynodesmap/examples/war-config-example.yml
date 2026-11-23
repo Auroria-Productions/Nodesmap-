@@ -1,0 +1,16 @@
+# Add to the existing plugins/nodes/config.yml ONLY if the core supports these modes.
+# These keys control public NodesMap visibility; NodesMap does NOT implement gameplay.
+war:
+  enabled: true
+  flagWar:
+    enabled: true
+  nodesWar:
+    enabled: true
+    stateFile: data/war/nodeswar.json
+  keyPointWars:
+    enabled: true
+    stateFile: data/war/key-point-battles.json
+  warzones:
+    enabled: true
+  raids:
+    enabled: false
