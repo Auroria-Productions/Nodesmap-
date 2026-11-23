@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Nodes Map</title>
+<link rel="icon" href="icons/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="style.css">
+  <style>
+    .square-pref { display:flex; align-items:center; gap:9px; margin:10px 0; font-size:13px; cursor:pointer; }
+    .square-pref input { accent-color:#d8ad4e; }
+    .square-hint { color:#94a5b9; font-size:12px; line-height:1.5; margin:4px 0 12px; }
+    #map { background-color: #182432; background-image: linear-gradient(#29405355 1px, transparent 1px), linear-gradient(90deg, #29405355 1px, transparent 1px); background-size: 32px 32px; }
+    #map-notice { position: absolute; z-index: 1000; right: 14px; bottom: 90px; max-width: min(270px, calc(100vw - 28px)); padding: 8px 12px; border-radius: 5px; background: #172433; color: #edf4fb; font-size: 13px; pointer-events: none; }
+    /* Public viewer's independent war system cards; editor styles are unchanged. */
+    #war-panel .war-system { padding: 4px 0 11px; border-bottom: 1px solid rgba(156,174,193,.14); }
+    #war-panel .war-system h3 { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 6px; }
+    #war-panel .war-system h4 { font-size: 12px; opacity: .8; margin: 12px 0 5px; }
+    .war-keypoint-pin { display: flex; width: 30px; height: 30px; align-items: center; justify-content: center;
+      background: #242d3a; color: #ffdb94; border: 2px solid #e3a951; border-radius: 50%;
+      box-shadow: 0 2px 9px #000a; font-size: 17px; font-weight: 700; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<header id="topbar">
+  <button id="menu-btn" class="icon-btn" aria-label="Toggle sidebar">
+    <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+  </button>
+  <div id="brand"><span class="brand-mark"></span><span id="title">Nodes Map</span></div>
+  <div id="search-wrap">
+    <svg class="search-ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+    <input id="search" type="search" placeholder="Search towns, nations, players, territories" autocomplete="off" spellcheck="false">
+    <div id="search-results" hidden></div>
+  </div>
+  <button id="fit-territories" class="pill-btn" hidden>Fit territories</button>
+  <button id="layers-btn" class="pill-btn" aria-expanded="false" aria-controls="view" title="Map layers and view options">
+    <svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5zM3 13l9 5 9-5"/></svg><span>Layers</span>
+  </button>
+  <div id="war-pill" hidden></div>
+</header>
+
+<aside id="sidebar">
+  <div class="list-tools side-tools">
+    <input class="filter" data-list="all" placeholder="Filter…">
+    <select class="sort" data-list="all" aria-label="Sort">
+      <option value="territories">Most land</option>
+      <option value="towns">Most towns</option>
+      <option value="residents">Most residents</option>
+      <option value="online">Most online</option>
+      <option value="name">Name</option>
+    </select>
+  </div>
+  <div id="side-scroll">
+    <section id="war-sec" class="sec">
+      <button id="war-head" class="sec-head" aria-expanded="true" title="War status">
+        <span class="wdot"></span><span class="sec-title">War</span><span id="war-sum"></span>
+        <svg class="chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div id="war-panel"></div>
+    </section>
+    <div id="list-tree"></div>
+  </div>
+</aside>
+
+<div id="view" class="view">
+  <div id="view-head">
+    <span>Map layers</span>
+    <button id="view-close" class="icon-btn" aria-label="Close">
+      <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+  <div id="view-body">
+    <div class="fh">Look</div>
+    <div id="presets" class="seg seg4"></div>
+    <div class="fh">Square-map edition</div>
+    <label class="square-pref"><input type="checkbox" id="square-map-toggle" checked> Square world boundary</label>
+    <label class="square-pref"><input type="checkbox" id="square-grid-toggle" checked> Square sector grid (16×16 chunks)</label>
+    <p class="square-hint">Visual map layout only. Existing territory ownership and shapes are unchanged.</p>
+    <div class="fh">Colour by</div>
+    <div id="modes" class="seg"></div>
+    <div id="mode-extra"></div>
+    <button id="custom-toggle" class="link-btn" aria-expanded="false"><span>Customize layers</span><svg class="chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+    <div id="layer-toggles" hidden></div>
+  </div>
+</div>
+
+<aside id="info" hidden>
+  <button id="info-close" class="icon-btn" aria-label="Close">
+    <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+  </button>
+  <div id="info-body"></div>
+</aside>
+
+<div id="map-notice" role="status">Loading map…</div>
+
+<footer id="statusbar">
+  <span id="coords">x —  z —</span>
+  <span id="hover-terr"></span>
+  <span id="render-progress" hidden></span>
+  <span id="live-dot" title="Live data"></span>
+</footer>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="geometry.js"></script>
+<script src="square-map.js?v=0.3.9"></script>
+<script src="war-systems.js?v=0.3.9"></script>
+<script src="app.js?v=0.3.9"></script>
+</body>
+</html>

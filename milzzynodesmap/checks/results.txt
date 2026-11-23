@@ -1,0 +1,12 @@
+Paper 1.21.11 and 26.3 with Nodes core dev.5.2
+- Painted a new territory in Chromium with the terrain requests returning 404.
+- Saved a browser draft, published it through the Paper console and verified the new territory in Nodes and the viewer endpoint.
+- Generated non-empty terrain PNGs from an empty tile cache and served them through NodesMap.
+
+Browser fixture using the public map snapshots
+- Displayed all nine territory shapes with colored fills when both terrain and the town endpoint were unavailable.
+- Verified that the Fit territories button and terrain status were available.
+
+Paper 1.21.11 regression checks
+- Rejected overlapping and stale drafts.
+- Kept last good map data when the saved files were temporarily unreadable and picked up valid saves on recovery.

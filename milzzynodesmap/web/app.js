@@ -1,0 +1,1677 @@
+/*
+ * NodesMap viewer
+ *
+ * Data (all polled with ETags, so unchanged data costs a 304):
+ *   data/map.json            map setup (NodesMap)
+ *   data/players.json        visible players (NodesMap, in memory)
+ *   data/tiles.json          recently redrawn tiles (NodesMap, in memory)
+ *   data/nodes/version.json  one hash per Nodes layer below (Nodes exporter)
+ *   data/nodes/world.json    territories + resource nodes      (rarely changes)
+ *   data/nodes/state.json    towns, nations, forts             (changes on claims etc.)
+ *   data/nodes/features.json ports, towers, refineries, drops  (rarely changes)
+ *   data/nodes/live.json     war, flags, occupation, warzones, raids, supply drop
+ */
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------- utils
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const fmtInt = (n) => (n ?? 0).toLocaleString();
+  const now = () => Date.now() + S.clockOffset;
+  const ll = (x, z) => L.latLng(z, x);
+  const chunkCenter = (cx, cz) => ll(cx * 16 + 8, cz * 16 + 8);
+
+  function fmtDur(ms) {
+    if (ms == null || !isFinite(ms)) return "—";
+    ms = Math.max(0, ms);
+    const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    return `${m}:${String(sec).padStart(2, "0")}`;
+  }
+  function fmtLong(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
+  function hexToRgb(h) {
+    const n = parseInt(h.slice(1), 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function shade(h, f) {
+    const [r, g, b] = hexToRgb(h);
+    const c = (v) => Math.max(0, Math.min(255, Math.round(f >= 0 ? v + (255 - v) * f : v * (1 + f))));
+    return "#" + ((1 << 24) | (c(r) << 16) | (c(g) << 8) | c(b)).toString(16).slice(1);
+  }
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem("nodesmap." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem("nodesmap." + k, JSON.stringify(v)); } catch { /* private mode */ } },
+  };
+
+  // ---------------------------------------------------------------- state
+  const S = {
+    info: null,
+    world: null, state: null, live: null, features: null, warSystems: null,
+    versions: {},
+    players: [],
+    clockOffset: 0,
+    terr: new Map(),        // id -> territory
+    chunkTerr: new Map(),   // chunk key -> territory id
+    towns: new Map(),       // name -> town
+    nations: new Map(),     // name -> nation
+    owner: new Map(),       // territory id -> town
+    occupier: new Map(),    // territory id -> town (captured territories)
+    residentTown: new Map(),// player name (lower) -> town
+    resources: {},          // resource node name -> {icon}
+    resIcons: {},           // icon name -> url
+    geom: new Map(),        // territory id -> latlng rings
+    tileBust: new Map(),
+  };
+
+  const EMPTY_STATE = { towns: [], nations: [] };
+  const NEUTRAL_COLORS = ["#59a39a", "#6f8dc4", "#b58b55", "#a184ba", "#79a26c", "#bf8076"];
+
+  const MODES = [
+    ["towns", "Towns"], ["nations", "Nations"], ["diplomacy", "Diplomacy"],
+    ["resources", "Resource"], ["supply", "Supply"], ["plain", "Terrain"],
+  ];
+  /** what the View box shows: one checkbox per group, each switching one or more layers */
+  const GROUPS = [
+    ["Territory colors", ["territories"]],
+    ["Borders", ["borders"]],
+    ["Town & nation names", ["townLabels", "nationLabels"]],
+    ["Territory names", ["terrLabels"]],
+    ["Territory IDs", ["terrIds"]],
+    ["Resources", ["resources"]],
+    ["Players", ["players"]],
+    ["War", ["war", "warzones", "raids", "keyPoints"]],
+    ["Buildings", ["forts", "outposts", "ports", "towers", "refineries", "drops"]],
+    ["Chunk grid", ["chunks"]],
+    ["Server borders", ["shards"]],
+  ];
+  const LAYERS = [
+    ["territories", "Territory fill", true],
+    ["borders", "Town borders", true],
+    ["townLabels", "Town names", true],
+    ["nationLabels", "Nation names", true],
+    ["terrLabels", "Territory names", false],
+    ["terrIds", "Territory IDs", false],
+    ["resources", "Resource icons", true],
+    ["players", "Players", true],
+    ["war", "War flags", true],
+    ["warzones", "Warzones", true],
+    ["raids", "Raids", true],
+    ["keyPoints", "Key-point battles", true],
+    ["forts", "Fortifications", true],
+    ["outposts", "Outposts", true],
+    ["ports", "Ports", true],
+    ["towers", "Mining towers", true],
+    ["refineries", "Refineries", true],
+    ["drops", "Supply drops", true],
+    ["chunks", "Chunk grid", false],
+    ["shards", "Server borders", true],
+  ];
+  const prefs = {
+    mode: store.get("mode", "towns"),
+    diploTown: store.get("diploTown", ""),
+    resource: store.get("resource", ""),
+    layers: Object.assign(Object.fromEntries(LAYERS.map(([k, , d]) => [k, d])), store.get("layers", {})),
+    sidebar: store.get("sidebar", window.innerWidth > 760),
+    warOpen: store.get("warOpen", true),
+    view: false,
+    squareFrame: store.get("squareFrame", true),
+    squareGrid: store.get("squareGrid", true),
+  };
+
+  // ---------------------------------------------------------------- map
+  const CRS = L.extend({}, L.CRS.Simple, { transformation: new L.Transformation(1, 0, 1, 0) });
+  const map = L.map("map", { crs: CRS, zoomControl: false, attributionControl: false, minZoom: -5, maxZoom: 3, zoomSnap: 1, wheelPxPerZoomLevel: 90, inertia: true, fadeAnimation: false });
+  L.control.zoom({ position: "bottomright" }).addTo(map);
+
+  function pane(name, z) {
+    const p = map.createPane(name);
+    p.style.zIndex = z;
+    return p;
+  }
+  pane("terr", 410); pane("occ", 420); pane("borders", 430); pane("zones", 440);
+  pane("labels", 610); pane("pins", 620); pane("players", 640); pane("flags", 650);
+  pane("grid", 405); pane("shards", 445);
+  const R = {
+    terr: L.svg({ pane: "terr", padding: 0.5 }),
+    occ: L.svg({ pane: "occ", padding: 0.5 }),
+    borders: L.svg({ pane: "borders", padding: 0.5 }),
+    zones: L.svg({ pane: "zones", padding: 0.5 }),
+    grid: L.canvas({ pane: "grid", padding: 0.2 }),
+  };
+
+  const G = {}; // layer groups by name
+  for (const k of ["terr", "occ", "borders", "zones", "townLabels", "nationLabels", "terrLabels", "terrIds", "resources", "players", "flags", "raids", "keyPoints", "forts", "outposts", "ports", "towers", "refineries", "drops", "grid", "shards"]) {
+    G[k] = L.layerGroup();
+  }
+  const terrPolys = new Map(); // id -> L.Polygon
+  const squareFrameLayer = L.layerGroup().addTo(map);
+  let squareBounds = null;
+  function refreshSquareFrame() {
+    squareFrameLayer.clearLayers();
+    squareBounds = S.world ? NodesSquare.bounds((S.world.territories || []).map((t) => t.chunks || []), 8) : null;
+    if (!prefs.squareFrame || !squareBounds) return;
+    squareFrameLayer.addLayer(L.rectangle(
+      [ll(squareBounds.minX, squareBounds.minZ), ll(squareBounds.maxX, squareBounds.maxZ)],
+      { color: "#f1c96d", weight: 2.5, opacity: 0.85, fill: false, dashArray: "12 6", interactive: false }
+    ));
+  }
+
+
+  // tiles
+  let tileLayer = null;
+  const TileLayer = L.TileLayer.extend({
+    getTileUrl(c) {
+      const k = -c.z;
+      const key = `${k}/${c.x}_${c.y}`;
+      const b = S.tileBust.get(key);
+      return `tiles/${encodeURIComponent(S.info.world)}/${key}.png${b ? "?t=" + b : ""}`;
+    },
+  });
+
+  // ---------------------------------------------------------------- svg patterns (striped = occupied)
+  const patterns = new Set();
+  /** striped fill (c1 background or "none", c2 stripes); defined in every svg renderer */
+  function stripe(c1, c2, op2 = 0.9) {
+    const id = "p" + (c1 + c2 + op2).replace(/[^a-z0-9]/gi, "");
+    if (patterns.has(id)) return `url(#${id})`;
+    for (const r of [R.terr, R.occ, R.zones]) {
+      const root = r._container;
+      if (!root) continue;
+      let defs = root.querySelector("defs");
+      if (!defs) { defs = document.createElementNS("http://www.w3.org/2000/svg", "defs"); root.prepend(defs); }
+      const p = document.createElementNS("http://www.w3.org/2000/svg", "pattern");
+      p.setAttribute("id", id);
+      p.setAttribute("patternUnits", "userSpaceOnUse");
+      p.setAttribute("width", "10"); p.setAttribute("height", "10");
+      p.setAttribute("patternTransform", "rotate(45)");
+      p.innerHTML = (c1 === "none" ? "" : `<rect width="10" height="10" fill="${c1}"/>`) + `<rect width="4" height="10" fill="${c2}" fill-opacity="${op2}"/>`;
+      defs.appendChild(p);
+    }
+    patterns.add(id);
+    return `url(#${id})`;
+  }
+
+  // ---------------------------------------------------------------- data loading
+  async function getJSON(url, syncClock) {
+    const r = await fetch(url, { cache: "no-cache", signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(url + " " + r.status);
+    if (syncClock) {
+      // line countdowns up with the server clock (HTTP Date header, 1s resolution)
+      const d = Date.parse(r.headers.get("Date") || "");
+      if (!isNaN(d)) S.clockOffset = d + 500 - Date.now();
+    }
+    return r.json();
+  }
+
+  function updateMapNotice() {
+    const notice = $("#map-notice");
+    if (!notice) return;
+    const tiles = Object.values(tileLayer?._tiles || {});
+    const hasTerrain = tiles.some((tile) => tile.current && tile.el.dataset.terrain === "loaded");
+    const message = S.rendering ? "Rendering terrain…" :
+      !S.world && S.info?.nodes ? "Waiting for Nodes territory data…" :
+      !hasTerrain ? (S.terr.size ? "Terrain unavailable here · showing territory outlines" : "No rendered terrain here yet") : "";
+    notice.hidden = !message;
+    if (message) notice.textContent = message;
+  }
+
+  async function init() {
+    S.info = await getJSON("data/map.json");
+    document.title = S.info.title;
+    $("#title").textContent = S.info.title;
+    const levels = S.info.zoomOutLevels;
+    map.setMinZoom(-levels);
+    tileLayer = new TileLayer("", {
+      tileSize: S.info.tileSize, minZoom: -levels, maxZoom: 3, minNativeZoom: -levels, maxNativeZoom: 0,
+      noWrap: true, updateWhenIdle: false, keepBuffer: 3,
+    });
+    tileLayer.on("tileload", ({ tile }) => {
+      tile.dataset.terrain = "loaded";
+      updateMapNotice();
+    });
+    tileLayer.on("tileerror", ({ tile }) => {
+      tile.dataset.terrain = "missing";
+      updateMapNotice();
+    });
+    map.on("moveend", () => requestAnimationFrame(updateMapNotice));
+
+    S.fitPending = !applyHash();
+    if (S.fitPending) map.setView(ll(S.info.spawn.x, S.info.spawn.z), -2);
+
+    for (const r of Object.values(R)) map.addLayer(r); // create svg containers up front (patterns live in them)
+    for (const g of Object.values(G)) g.addTo(map);
+    buildUi();
+    drawShards();
+    if (S.info.players === false) setPlayersEnabled(false);
+    syncLayerVisibility();
+
+    getJSON("icons/resource_icons.json").then((icons) => {
+      S.resIcons = icons;
+      if (S.world) drawResources();
+    }).catch(() => {});
+    // Let the territory data pick the first viewport before requesting terrain PNGs.
+    const poll = async () => {
+      try {
+        await pollVersions();
+      } catch (e) {
+        console.error("Could not update Nodes map data", e);
+      } finally {
+        setTimeout(poll, 2500);
+      }
+    };
+    await poll();
+    await pollWarSystems();
+    setInterval(pollWarSystems, 5000);
+    tileLayer.addTo(map);
+    pollPlayers();
+    setInterval(pollPlayers, 2000);
+    pollTiles();
+    setInterval(pollTiles, 8000);
+    setInterval(tickTimers, 1000);
+  }
+
+  async function pollVersions() {
+    let v;
+    try {
+      v = await getJSON("data/nodes/version.json", true);
+      $("#live-dot").className = "on";
+    } catch {
+      $("#live-dot").className = S.info.nodes ? "err" : "";
+      updateMapNotice();
+      return;
+    }
+    const changed = ["world", "state", "features", "live"].filter((k) => v[k] && v[k] !== S.versions[k]);
+    await Promise.all(changed.map(async (k) => {
+      try {
+        S[k] = await getJSON(`data/nodes/${k}.json`);
+      } catch {
+        return;
+      }
+      onData({ [k]: true });
+      S.versions[k] = v[k];
+      updateMapNotice();
+    }));
+  }
+
+  async function pollWarSystems() {
+    try {
+      const latest = await getJSON("data/nodes/war-systems.json");
+      if (JSON.stringify(latest) !== JSON.stringify(S.warSystems)) {
+        S.warSystems = latest;
+        renderWar(); drawWar(); drawZones(); drawKeyPoints();
+      }
+    } catch {
+      // Older NodesMap / Nodes builds do not expose this endpoint.
+      // Keep their legacy live.json panel working.
+    }
+  }
+
+  async function pollPlayers() {
+    try {
+      const d = await getJSON("data/players.json");
+      S.players = d.players || [];
+      setPlayersEnabled(!d.disabled);
+      if (prefs.layers.players) drawPlayers();
+    } catch { /* ignore */ }
+  }
+
+  /** the server can turn player markers off entirely (/nodesmap players off) */
+  function setPlayersEnabled(on) {
+    if (S.playersOn === on) return;
+    S.playersOn = on;
+    const row = document.querySelector('#layer-toggles input[data-group="Players"]')?.closest("label");
+    if (row) row.hidden = !on;
+    const opt = document.querySelector('.sort[data-list="towns"] option[value="online"]');
+    if (opt) opt.hidden = !on;
+    if (!on) G.players.clearLayers();
+  }
+
+  async function pollTiles() {
+    let d;
+    try { d = await getJSON("data/tiles.json"); } catch { return; }
+    S.rendering = !!(d.render && d.render.total > d.render.done);
+    const rp = $("#render-progress");
+    if (!rp) { /* customised viewer without the progress element */ } else if (d.render && d.render.total > 0) {
+      rp.hidden = false;
+      rp.textContent = `Drawing map ${Math.floor((d.render.done / d.render.total) * 100)}%`;
+    } else {
+      rp.hidden = true;
+    }
+    updateMapNotice();
+    for (const [key, ts] of d.updates || []) {
+      if (ts <= (S.tileBust.get(key) || 0)) continue;
+      S.tileBust.set(key, ts);
+      const [k, xz] = key.split("/");
+      const [x, z] = xz.split("_");
+      const t = tileLayer && tileLayer._tiles[`${x}:${z}:${-k}`];
+      if (t) {
+        t.el.onload = () => { t.el.dataset.terrain = "loaded"; updateMapNotice(); };
+        t.el.onerror = () => { t.el.dataset.terrain = "missing"; updateMapNotice(); };
+        t.el.src = tileLayer.getTileUrl({ x: +x, y: +z, z: -k });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- indexing
+  function indexWorld() {
+    S.terr.clear(); S.chunkTerr.clear(); S.geom.clear();
+    S.resources = S.world.resources || {};
+    for (const t of S.world.territories) {
+      S.terr.set(t.id, t);
+      const c = t.chunks;
+      for (let i = 0; i < c.length; i += 2) S.chunkTerr.set(NodesGeom.key(c[i], c[i + 1]), t.id);
+      S.geom.set(t.id, NodesGeom.outline(c, 16).map((ring) => ring.map(([x, z]) => ll(x, z))));
+    }
+  }
+
+  function indexState() {
+    S.towns.clear(); S.nations.clear(); S.owner.clear(); S.occupier.clear(); S.residentTown.clear();
+    for (const n of S.state.nations) { n.townList = []; S.nations.set(n.name, n); }
+    for (const t of S.state.towns) {
+      S.towns.set(t.name, t);
+      for (const id of t.territories) S.owner.set(id, t);
+      for (const id of t.captured || []) S.occupier.set(id, t);
+      for (const r of t.residents) S.residentTown.set(r.toLowerCase(), t);
+      const n = t.nation && S.nations.get(t.nation);
+      if (n) n.townList.push(t);
+    }
+    for (const n of S.nations.values()) {
+      n.territories = n.townList.reduce((a, t) => a + t.territories.length, 0);
+      n.residents = n.townList.reduce((a, t) => a + t.residents.length, 0);
+    }
+  }
+
+  function nationColor(t) {
+    const n = t && t.nation && S.nations.get(t.nation);
+    return n ? n.color : null;
+  }
+  function onlineCount(t) {
+    let n = 0;
+    const set = new Set(t.residents.map((r) => r.toLowerCase()));
+    for (const p of S.players) if (set.has(p.name.toLowerCase())) n++;
+    return n;
+  }
+
+  function fitTerritories() {
+    const b = L.latLngBounds([]);
+    if (prefs.squareFrame && squareBounds) {
+      b.extend(ll(squareBounds.minX, squareBounds.minZ));
+      b.extend(ll(squareBounds.maxX, squareBounds.maxZ));
+    }
+    else for (const rings of S.geom.values()) {
+      for (const ring of rings) for (const point of ring) b.extend(point);
+    }
+    if (!b.isValid()) return;
+    S.fitPending = false;
+    const sidebar = prefs.sidebar && window.innerWidth > 760 ? $("#sidebar")?.offsetWidth ?? 0 : 0;
+    map.fitBounds(b.pad(0.08), { animate: false, maxZoom: 0, paddingTopLeft: [sidebar + 16, 55], paddingBottomRight: [16, 44] });
+  }
+
+  // ---------------------------------------------------------------- reacting to data
+  function onData(changed) {
+    if (changed.world && S.world) {
+      indexWorld(); refreshSquareFrame(); buildTerritories();
+      if (S.fitPending && S.terr.size) fitTerritories();
+      const fit = $("#fit-territories");
+      if (fit) fit.hidden = !S.terr.size;
+    }
+    if (changed.state && S.state) indexState();
+    if ((changed.world || changed.state) && S.world) {
+      S.state ??= EMPTY_STATE;
+      styleTerritories(); drawBorders(); drawLabels(); drawResources(); drawForts(); drawOutposts();
+      renderLists(); refreshModeExtra(); buildSearch(); refreshInfo();
+    }
+    if (changed.features && S.features) drawFeatures();
+    if ((changed.live || changed.state || changed.world) && S.live && S.world) {
+      drawWar(); drawZones(); drawKeyPoints(); styleTerritories(); renderWar(); refreshInfo();
+    }
+    if (changed.state) drawPlayers();
+  }
+
+  // ---------------------------------------------------------------- territories
+  function buildTerritories() {
+    G.terr.clearLayers();
+    terrPolys.clear();
+    for (const [id, rings] of S.geom) {
+      const p = L.polygon(rings, { renderer: R.terr, weight: 1, smoothFactor: 0.5, interactive: false });
+      terrPolys.set(id, p);
+      G.terr.addLayer(p);
+    }
+    drawChunkGrid();
+  }
+
+  function supplyCut(id, town) {
+    if (!town || !town.supplied) return false;
+    return !town.supplied.includes(id);
+  }
+
+  function terrStyle(id) {
+    const town = S.owner.get(id);
+    const occ = S.occupier.get(id);
+    const mode = prefs.mode;
+    const showFill = prefs.layers.territories;
+    let fill = null, op = 0.42, stroke = "rgba(255,255,255,0.22)", weight = 1;
+
+    if (mode === "plain") {
+      return { fill: !!town, fillColor: town ? town.color : "#000", fillOpacity: town ? 0.08 : 0, color: town ? shade(town.color, 0.25) : "rgba(255,255,255,0.18)", weight: 1, opacity: 0.8 };
+    }
+    if (mode === "towns" && town) { fill = town.color; stroke = shade(town.color, -0.25); }
+    if (mode === "nations" && town) { fill = nationColor(town) || town.color; op = nationColor(town) ? 0.48 : 0.25; stroke = shade(fill, -0.3); }
+    if (mode === "diplomacy") {
+      const me = S.towns.get(prefs.diploTown);
+      if (me && town) {
+        const myNation = me.nation, rel =
+          town === me ? "own" :
+          me.enemies.includes(town.name) || (myNation && S.nations.get(myNation)?.enemies.includes(town.nation)) ? "enemy" :
+          myNation && town.nation === myNation ? "nation" :
+          me.allies.includes(town.name) || (myNation && S.nations.get(myNation)?.allies.includes(town.nation)) ? "ally" :
+          me.vassals?.includes(town.name) || me.overlord === town.name ? "vassal" : "neutral";
+        fill = { own: "#4f8ad9", nation: "#2fb3a6", ally: "#46a758", vassal: "#9b6bd6", enemy: "#e5484d", neutral: "#6b7280" }[rel];
+        op = rel === "neutral" ? 0.25 : 0.5;
+      } else if (town) { fill = "#6b7280"; op = 0.22; }
+    }
+    if (mode === "resources") {
+      const t = S.terr.get(id);
+      const hit = prefs.resource && t && t.resources.includes(prefs.resource);
+      fill = hit ? "#f5c542" : town ? "#3b4250" : null;
+      op = hit ? 0.62 : 0.3;
+      stroke = hit ? "#f5c542" : stroke;
+    }
+    if (mode === "supply" && town) {
+      fill = town.color;
+      if (supplyCut(id, town)) {
+        return { fill: showFill, fillColor: stripe(town.color, "#e5484d"), fillOpacity: 0.7, color: "#e5484d", weight: 1.5, opacity: 1 };
+      }
+    }
+    if (!fill && !town && (mode === "towns" || mode === "nations")) {
+      const index = Number(S.terr.get(id)?.color ?? id);
+      const neutral = NEUTRAL_COLORS[index % NEUTRAL_COLORS.length] || NEUTRAL_COLORS[0];
+      return { fill: showFill, fillColor: neutral, fillOpacity: 0.34, color: neutral, weight, opacity: 0.9 };
+    }
+    if (!fill) return { fill: false, color: stroke, weight, opacity: 1 };
+    if (occ && occ !== town && prefs.layers.war) {
+      return { fill: showFill, fillColor: stripe(fill, occ.color), fillOpacity: 0.62, color: stroke, weight, opacity: 1 };
+    }
+    return { fill: showFill, fillColor: fill, fillOpacity: op, color: stroke, weight, opacity: 1 };
+  }
+
+  function styleTerritories() {
+    if (!S.state) return;
+    for (const [id, p] of terrPolys) p.setStyle(terrStyle(id));
+  }
+
+  /** thick outline around each town's whole realm (or each nation's in nation mode) */
+  const borderCache = new Map();
+  function drawBorders() {
+    G.borders.clearLayers();
+    if (!S.state || !S.world) return;
+    const byNation = prefs.mode === "nations";
+    const groups = new Map();
+    for (const t of S.towns.values()) {
+      const key = byNation && t.nation ? "n:" + t.nation : "t:" + t.name;
+      const color = byNation && t.nation ? nationColor(t) : t.color;
+      if (!groups.has(key)) groups.set(key, { color, ids: [] });
+      groups.get(key).ids.push(...t.territories);
+    }
+    for (const [key, g] of groups) {
+      const sig = g.ids.slice().sort((a, b) => a - b).join(",");
+      let rings = borderCache.get(key);
+      if (!rings || rings.sig !== sig) {
+        const cells = [];
+        for (const id of g.ids) { const t = S.terr.get(id); if (t) cells.push(...t.chunks); }
+        rings = NodesGeom.outline(cells, 16).map((r) => r.map(([x, z]) => ll(x, z)));
+        rings.sig = sig;
+        borderCache.set(key, rings);
+      }
+      if (!rings.length) continue;
+      G.borders.addLayer(L.polygon(rings, { renderer: R.borders, fill: false, color: shade(g.color, 0.35), weight: byNation ? 3.5 : 2.5, opacity: 0.95, interactive: false }));
+    }
+  }
+
+  /** Server borders (Reef sharding): one dashed outline per region, labelled with its server. */
+  function drawShards() {
+    G.shards.clearLayers();
+    const shards = S.info.shards || [];
+    const group = document.querySelector('#layer-toggles input[data-group="Server borders"]')?.closest("label");
+    if (group) group.hidden = !shards.length;
+    if (!shards.length) return;
+    const names = [...new Set(shards.map((s) => s.server))];
+    const colors = ["#ff7a45", "#36cfc9", "#b37feb", "#ffd666", "#73d13d", "#ff85c0", "#69b1ff", "#ffa940"];
+    for (const s of shards) {
+      const color = colors[names.indexOf(s.server) % colors.length];
+      const rect = L.polygon(s.points.map(([x, z]) => ll(x, z)), {
+        pane: "shards", color, weight: 3, opacity: 0.95, dashArray: "10 8", fill: true, fillColor: color, fillOpacity: 0.05, interactive: false,
+      });
+      rect.bindTooltip(`Server ${s.server}`, { permanent: true, direction: "center", className: "shard-label", opacity: 0.9 });
+      G.shards.addLayer(rect);
+    }
+  }
+
+  function drawChunkGrid() {
+    G.grid.clearLayers();
+    if (!prefs.layers.chunks && !prefs.squareGrid) return;
+    const b = map.getBounds();
+    const viewport = { minX: b.getWest(), maxX: b.getEast(), minZ: b.getNorth(), maxZ: b.getSouth() };
+    if (prefs.squareGrid && squareBounds) {
+      const lines = NodesSquare.segments(squareBounds, viewport, 16, 110);
+      if (lines.length) G.grid.addLayer(L.polyline(lines.map((line) => line.map(([x, z]) => ll(x, z))),
+        { renderer: R.grid, color: "#f1c96d", opacity: 0.35, weight: 1, interactive: false }));
+    }
+    if (prefs.layers.chunks && map.getZoom() >= 0) {
+      // Cap canvas paths in case the viewport is unusually large.
+      const frame = squareBounds || viewport;
+      const lines = NodesSquare.segments(frame, viewport, 1, 140);
+      if (lines.length) G.grid.addLayer(L.polyline(lines.map((line) => line.map(([x, z]) => ll(x, z))),
+        { renderer: R.grid, color: "#000", opacity: 0.22, weight: 1, interactive: false }));
+    }
+  }
+
+  // ---------------------------------------------------------------- labels + icons
+  // ---------------------------------------------------------------- labels
+  // Labels are laid out on screen after every zoom/pan: biggest first, and any
+  // label that would overlap one already placed is left out until there's room.
+  let labelDefs = [];
+  const prettyName = (s) => String(s ?? "").replace(/_/g, " ");
+  const measureCtx = document.createElement("canvas").getContext("2d");
+  let fontFamily = null;
+  function textWidth(text, px, weight, spacingEm) {
+    fontFamily = fontFamily || getComputedStyle(document.body).fontFamily;
+    measureCtx.font = `${weight} ${px}px ${fontFamily}`;
+    return measureCtx.measureText(text).width + text.length * px * spacingEm;
+  }
+
+  /** the nation's biggest connected group of territories (by chunks) */
+  function mainLandmass(ids) {
+    const set = new Set(ids);
+    const seen = new Set();
+    let best = [], bestSize = -1;
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      const comp = [id];
+      seen.add(id);
+      for (let i = 0; i < comp.length; i++) {
+        const t = S.terr.get(comp[i]);
+        for (const nb of (t && t.neighbors) || []) {
+          if (set.has(nb) && !seen.has(nb)) { seen.add(nb); comp.push(nb); }
+        }
+      }
+      const size = comp.reduce((a, cid) => a + ((S.terr.get(cid)?.chunks.length || 0) >> 1), 0);
+      if (size > bestSize) { bestSize = size; best = comp; }
+    }
+    return { ids: best, chunks: bestSize };
+  }
+
+  function drawLabels() {
+    labelDefs = [];
+    const capitals = new Set([...S.nations.values()].map((n) => n.capital));
+    for (const n of S.nations.values()) {
+      const ids = n.townList.flatMap((t) => t.territories).filter((id) => S.terr.has(id));
+      if (!ids.length) continue;
+      const main = mainLandmass(ids);
+      const c = NodesGeom.labelCell(main.ids.map((id) => S.terr.get(id).core));
+      if (!c) continue;
+      // block-space extent of the main landmass: the name is sized to fit inside it
+      let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+      for (const id of main.ids) {
+        const cs = S.terr.get(id).chunks;
+        for (let i = 0; i < cs.length; i += 2) {
+          if (cs[i] < x0) x0 = cs[i];
+          if (cs[i] > x1) x1 = cs[i];
+          if (cs[i + 1] < z0) z0 = cs[i + 1];
+          if (cs[i + 1] > z1) z1 = cs[i + 1];
+        }
+      }
+      labelDefs.push({
+        kind: "nation", latlng: chunkCenter(c[0], c[1]), priority: 1e7 + main.chunks,
+        text: prettyName(n.name).toUpperCase(), color: shade(n.color, 0.55), towns: n.townList.length,
+        spanX: (x1 - x0 + 1) * 16, spanZ: (z1 - z0 + 1) * 16,
+      });
+    }
+    for (const t of S.towns.values()) {
+      const home = S.terr.get(t.home);
+      if (!home) continue;
+      const isCap = capitals.has(t.name);
+      const text = prettyName(t.name);
+      // capital: the star sits exactly on the home core chunk, the name hangs below it
+      labelDefs.push({
+        kind: "town", latlng: chunkCenter(home.core[0], home.core[1]), priority: 1e5 + t.territories.length * 10 + (isCap ? 5 : 0),
+        w: textWidth(text, 12.5, 700, 0), h: isCap ? 28 : 15, dy: isCap ? 7 : 0,
+        html: isCap
+          ? `<div class="lbl town capital"><span class="cap">★</span><span class="nm">${esc(text)}</span></div>`
+          : `<div class="lbl town">${esc(text)}</div>`,
+      });
+    }
+    for (const t of S.terr.values()) {
+      if (!t.name) continue;
+      labelDefs.push({
+        kind: "terr", latlng: ll(t.core[0] * 16 + 8, t.core[1] * 16 + 8), dy: -15, priority: (t.chunks.length >> 1),
+        w: textWidth(t.name, 10.5, 600, 0), h: 13,
+        html: `<div class="lbl terr" style="margin-top:-15px">${esc(t.name)}</div>`,
+      });
+    }
+    for (const t of S.terr.values()) {
+      const txt = "#" + t.id;
+      labelDefs.push({
+        kind: "terrid", latlng: ll(t.core[0] * 16 + 8, t.core[1] * 16 + 8), dy: 15, priority: (t.chunks.length >> 1) - 1000,
+        w: textWidth(txt, 10.5, 600, 0), h: 13,
+        html: `<div class="lbl terr id" style="margin-top:15px">${txt}</div>`,
+      });
+    }
+    labelDefs.sort((a, b) => b.priority - a.priority);
+    layoutLabels();
+  }
+
+  let layoutTimer = 0;
+  function scheduleLayout() {
+    clearTimeout(layoutTimer);
+    layoutTimer = setTimeout(layoutLabels, 40);
+  }
+
+  /**
+   * Fit a nation name inside its land at the current zoom: font between 9 and
+   * 15px, wrapped onto two lines when that fits better.
+   */
+  function fitNation(d, scale) {
+    const areaW = d.spanX * scale * 0.9;
+    const areaH = d.spanZ * scale * 0.9;
+    const words = d.text.split(" ");
+    const options = [[d.text]];
+    if (words.length > 1) {
+      let best = null;
+      for (let i = 1; i < words.length; i++) {
+        const a = words.slice(0, i).join(" "), b = words.slice(i).join(" ");
+        const diff = Math.abs(a.length - b.length);
+        if (!best || diff < best[0]) best = [diff, [a, b]];
+      }
+      options.push(best[1]);
+    }
+    let pick = null;
+    for (const lines of options) {
+      const unit = Math.max(...lines.map((l) => textWidth(l, 10, 800, 0.05))) / 10; // width per px of font
+      const byWidth = areaW / unit;
+      const byHeight = areaH / (lines.length * 1.15);
+      const px = Math.max(9, Math.min(15, Math.floor(Math.min(byWidth, byHeight))));
+      if (!pick || px > pick.px) pick = { lines, px, unit };
+    }
+    const sub = d.towns > 1 && pick.px >= 11;
+    return {
+      w: pick.unit * pick.px,
+      h: pick.lines.length * pick.px * 1.12 + (sub ? 11 : 0),
+      html: `<div class="lbl nation" style="font-size:${pick.px}px;color:${d.color}">${pick.lines.map(esc).join("<br>")}${sub ? `<span class="n">${d.towns} towns</span>` : ""}</div>`,
+    };
+  }
+
+  function layoutLabels() {
+    G.townLabels.clearLayers(); G.nationLabels.clearLayers(); G.terrLabels.clearLayers(); G.terrIds.clearLayers();
+    const z = map.getZoom();
+    const scale = Math.pow(2, z); // screen pixels per block
+    const show = {
+      nation: prefs.layers.nationLabels && z <= -3,
+      town: prefs.layers.townLabels && z >= -3,
+      terr: prefs.layers.terrLabels && z >= 0,
+      terrid: prefs.layers.terrIds && z >= -1,
+    };
+    const size = map.getSize();
+    const pad = 3;
+    const placed = [];
+    const group = { nation: G.nationLabels, town: G.townLabels, terr: G.terrLabels, terrid: G.terrIds };
+    for (const d of labelDefs) {
+      if (!show[d.kind]) continue;
+      if (d.kind === "nation") Object.assign(d, fitNation(d, scale));
+      const p = map.latLngToContainerPoint(d.latlng);
+      if (d.dy) p.y += d.dy;
+      const x0 = p.x - d.w / 2 - pad, x1 = p.x + d.w / 2 + pad;
+      const y0 = p.y - d.h / 2 - pad / 2, y1 = p.y + d.h / 2 + pad / 2;
+      if (x1 < -50 || y1 < -50 || x0 > size.x + 50 || y0 > size.y + 50) continue;
+      let hit = false;
+      for (const r of placed) {
+        if (x0 < r[2] && x1 > r[0] && y0 < r[3] && y1 > r[1]) { hit = true; break; }
+      }
+      if (hit) continue;
+      placed.push([x0, y0, x1, y1]);
+      group[d.kind].addLayer(L.marker(d.latlng, {
+        pane: "labels", interactive: false, keyboard: false,
+        icon: L.divIcon({ className: "", iconSize: null, html: d.html }),
+      }));
+    }
+  }
+
+
+  function resIconUrl(nodeName) {
+    const r = S.resources[nodeName];
+    const icon = (r && r.icon) || nodeName;
+    return S.resIcons[icon] || S.resIcons[String(icon).toLowerCase()] || null;
+  }
+
+  function drawResources() {
+    G.resources.clearLayers();
+    for (const t of S.terr.values()) {
+      const icons = t.resources.map((r) => [r, resIconUrl(r)]).filter(([, u]) => u).slice(0, 3);
+      if (!icons.length) continue;
+      G.resources.addLayer(L.marker(ll(t.core[0] * 16 + 8, t.core[1] * 16 + 8), {
+        pane: "labels", interactive: false, keyboard: false,
+        icon: L.divIcon({ className: "", iconSize: null, html: `<div class="res-stack"${icons.length > 1 ? ` data-more="${icons.length - 1}"` : ""}>${icons.map(([r, u]) => `<img src="${esc(u)}" alt="" data-tipres="${esc(r)}">`).join("")}</div>` }),
+      }));
+    }
+  }
+
+  function pin(cls, html, latlng, tip, onClick, paneName = "pins") {
+    const m = L.marker(latlng, { pane: paneName, icon: L.divIcon({ className: "", iconSize: null, html: `<div class="pin ${cls}">${html}</div>` }) });
+    if (tip) m.bindTooltip(tip, { className: "nm-tip", direction: "top", offset: [0, -14] });
+    if (onClick) m.on("click", onClick);
+    return m;
+  }
+
+  const ICON = {
+    tower: `<svg viewBox="0 0 24 24"><path d="M8 21l2-14h4l2 14M7 7h10M9 3h6v4H9zM8 14h8"/></svg>`,
+    refinery: `<svg viewBox="0 0 24 24"><path d="M3 21V11l5 3V11l5 3V7l8 4v10zM3 21h18"/></svg>`,
+    drop: `<svg viewBox="0 0 24 24"><path d="M12 3c-4 0-7 3-7 6h14c0-3-3-6-7-6zM5 9l7 8 7-8M12 17v2M9 19h6v3H9z"/></svg>`,
+    outpost: `<svg viewBox="0 0 24 24"><path d="M6 21V4M6 4h11l-3 4 3 4H6"/></svg>`,
+  };
+
+  function drawFeatures() {
+    G.ports.clearLayers(); G.towers.clearLayers(); G.refineries.clearLayers(); G.drops.clearLayers();
+    const f = S.features || {};
+    for (const p of f.ports || []) {
+      G.ports.addLayer(pin("port", `<img src="icons/anchor.png" alt="">`, ll(p.x, p.z),
+        `<b>${esc(p.name)}</b><br>${p.public ? "Public port" : "Port"}${p.groups?.length ? " · " + esc(p.groups.join(", ")) : ""}`));
+    }
+    for (const t of f.towers || []) {
+      const rewards = (t.rewards || []).map((r) => `${r.amount}× ${esc(prettyMat(r.material))}`).join("<br>");
+      G.towers.addLayer(pin("tower", ICON.tower, ll(t.x, t.z),
+        `<b>Mining tower</b> <span style="color:var(--faint)">${esc(t.id)}</span><br>Cooldown ${fmtLong(t.cooldownSeconds * 1000)}${rewards ? "<br>" + rewards : ""}`));
+    }
+    for (const r of f.refineries || []) {
+      const outs = (r.outputs || []).map((o) => `${o.amount}× ${esc(prettyMat(o.material))}`).join("<br>");
+      G.refineries.addLayer(pin("refinery", ICON.refinery, ll(r.x, r.z),
+        `<b>Refinery</b> <span style="color:var(--faint)">${esc(r.id)}</span><br>Every ${fmtLong(r.intervalMs)}${outs ? "<br>" + outs : ""}`));
+    }
+    drawDrops();
+  }
+
+  function drawDrops() {
+    G.drops.clearLayers();
+    const f = S.features || {};
+    const active = S.live && S.live.supplyDrop && S.live.supplyDrop.active;
+    for (const d of f.dropPoints || []) {
+      const isActive = active && active.id === d.id;
+      G.drops.addLayer(pin("drop" + (isActive ? " active" : ""), ICON.drop, ll(d.x, d.z),
+        isActive ? `<b>Supply drop!</b><br>${active.landed ? "Landed" : "Landing"}` : `<b>Drop zone</b> ${esc(d.id)}`));
+    }
+  }
+
+  function drawForts() {
+    G.forts.clearLayers();
+    const forts = (S.state && S.state.forts) || {};
+    for (const [id, lvl] of Object.entries(forts)) {
+      const t = S.terr.get(+id);
+      if (!t || !lvl) continue;
+      const town = S.owner.get(+id);
+      const m = pin("fort", `F${lvl}`, ll(t.core[0] * 16 + 15, t.core[1] * 16 + 1), `<b>Fortification level ${lvl}</b><br>${esc(t.name || "Territory #" + t.id)}`, () => showTerritory(t.id));
+      m.options.icon.options.html = `<div class="pin fort" style="background:${town ? shade(town.color, -0.35) : "#333"}">F${lvl}</div>`;
+      G.forts.addLayer(m);
+    }
+  }
+
+  function drawOutposts() {
+    G.outposts.clearLayers();
+    for (const t of S.towns.values()) {
+      for (const o of t.outposts || []) {
+        const m = pin("outpost", ICON.outpost, ll(o.x, o.z), `<b>${esc(o.name)}</b><br>Outpost of ${esc(t.name)}`, () => showTown(t.name));
+        m.options.icon.options.html = `<div class="pin outpost" style="border-color:${t.color};color:${t.color}">${ICON.outpost}</div>`;
+        G.outposts.addLayer(m);
+      }
+    }
+  }
+
+  const prettyMat = (m) => String(m || "").toLowerCase().replace(/_/g, " ");
+
+  // ---------------------------------------------------------------- players
+  function drawPlayers() {
+    G.players.clearLayers();
+    if (!prefs.layers.players) return;
+    for (const p of S.players) {
+      const town = S.residentTown.get(p.name.toLowerCase());
+      const c = town ? town.color : "#ffffff";
+      const m = L.marker(ll(p.x, p.z), {
+        pane: "players",
+        icon: L.divIcon({
+          className: "", iconSize: null,
+          html: `<div class="player" style="--c:${c}"><img src="https://mc-heads.net/avatar/${esc(p.uuid)}/16" alt="" onerror="this.replaceWith(Object.assign(document.createElement('i'),{className:'dot'}))"><span>${esc(p.name)}</span></div>`,
+        }),
+      });
+      m.bindTooltip(`<b>${esc(p.name)}</b>${town ? "<br>" + esc(town.name) + (town.nation ? " · " + esc(town.nation) : "") : "<br>No town"}<br><span style="color:var(--faint)">${p.x}, ${p.z}</span>`, { className: "nm-tip", direction: "top", offset: [0, -10] });
+      if (town) m.on("click", () => showTown(town.name));
+      G.players.addLayer(m);
+    }
+  }
+
+  // ---------------------------------------------------------------- war
+  function attackRemaining(a) {
+    return a.remainingMs - (S.live.at ? now() - S.live.at : 0);
+  }
+
+  function drawWar() {
+    G.occ.clearLayers(); G.flags.clearLayers();
+    const live = S.live;
+    if (!live || !prefs.layers.war || (!configuredWarSystems().flagWar?.enabled && !configuredWarSystems().nodesWar?.enabled)) return;
+    // occupied chunks grouped by occupier town
+    const byTown = new Map();
+    for (const [x, z, town] of live.occupied || []) {
+      if (!byTown.has(town)) byTown.set(town, []);
+      byTown.get(town).push(x, z);
+    }
+    for (const [name, cells] of byTown) {
+      const t = S.towns.get(name);
+      const color = t ? t.color : "#e5484d";
+      const rings = NodesGeom.outline(cells, 16).map((r) => r.map(([x, z]) => ll(x, z)));
+      const poly = L.polygon(rings, { renderer: R.occ, fillColor: stripe("none", color, 0.85), fillOpacity: 1, color: shade(color, 0.3), weight: 1.5, interactive: true });
+      poly.bindTooltip(`Occupied by <b>${esc(name)}</b><br>${cells.length / 2} chunks`, { className: "nm-tip", sticky: true });
+      G.occ.addLayer(poly);
+    }
+    // active flags
+    for (const a of live.attacks || []) {
+      const t = S.towns.get(a.town);
+      const color = t ? t.color : "#e5484d";
+      const pct = Math.round(a.progress * 100);
+      const terr = S.terr.get(S.chunkTerr.get(NodesGeom.key(a.cx, a.cz)));
+      G.flags.addLayer(L.rectangle([ll(a.cx * 16, a.cz * 16), ll(a.cx * 16 + 16, a.cz * 16 + 16)], { renderer: R.zones, color: "#ff5f62", weight: 2, dashArray: "4 4", fill: false, interactive: false }));
+      const m = L.marker(ll(a.fx + 0.5, a.fz + 0.5), {
+        pane: "flags",
+        icon: L.divIcon({ className: "", iconSize: null, html: `<div class="flag" style="--c:${color};--p:${pct}"><div class="ring"></div><div class="core">${pct}</div></div>` }),
+      });
+      m.bindTooltip(() => `<b>${esc(a.town)}</b> attacking ${esc(terr ? terr.name || "territory #" + terr.id : "chunk")}<br>by ${esc(a.attacker || "?")} · ${pct}% · ${fmtDur(attackRemaining(a))} left`, { className: "nm-tip", direction: "top", offset: [0, -18] });
+      if (terr) m.on("click", () => showTerritory(terr.id));
+      G.flags.addLayer(m);
+    }
+  }
+
+  function drawZones() {
+    G.zones.clearLayers(); G.raids.clearLayers();
+    const live = S.live;
+    if (!live) return;
+    if (prefs.layers.warzones && configuredWarSystems().warzones?.enabled) {
+      for (const z of live.warzones || []) {
+        if (!z.enabled) continue;
+        const town = S.towns.get(z.town);
+        if (!town) continue;
+        for (const id of town.territories) {
+          const g = S.geom.get(id);
+          if (g) G.zones.addLayer(L.polygon(g, { renderer: R.zones, fill: false, color: "#f5c542", weight: 3, dashArray: "10 6", interactive: false }));
+        }
+        const home = S.terr.get(town.home);
+        if (home) {
+          const tag = L.marker(ll(home.core[0] * 16 + 8, home.core[1] * 16 - 24), {
+            pane: "flags", interactive: true,
+            icon: L.divIcon({ className: "", iconSize: null, html: `<div class="timer-tag" data-ends="${z.endsAt}" style="--c:#f5c542"><small>WARZONE ${esc(z.town)}</small><span class="t">${fmtDur(z.endsAt - now())}</span></div>` }),
+          });
+          tag.on("click", () => openTab("war"));
+          G.zones.addLayer(tag);
+        }
+      }
+    }
+    if (prefs.layers.raids && configuredWarSystems().raids?.enabled) {
+      for (const r of live.raids || []) {
+        const g = S.geom.get(r.territory);
+        const t = S.terr.get(r.territory);
+        if (!g || !t) continue;
+        const isLive = r.phase === "LIVE";
+        G.raids.addLayer(L.polygon(g, { renderer: R.zones, fill: true, fillColor: isLive ? "#e5484d" : "#f59e0b", fillOpacity: 0.12, color: isLive ? "#ff5f62" : "#f59e0b", weight: 3, dashArray: isLive ? null : "6 6", interactive: false }));
+        const ends = isLive ? r.liveEndsAt : r.prepEndsAt;
+        G.raids.addLayer(L.marker(ll(t.core[0] * 16 + 8, t.core[1] * 16 + 8), {
+          pane: "flags", interactive: false,
+          icon: L.divIcon({ className: "", iconSize: null, html: `<div class="timer-tag" data-ends="${ends}" style="--c:${isLive ? "#ff5f62" : "#f59e0b"}"><small>RAID ${isLive ? "LIVE" : "PREP"} · ${esc(r.attacker)} → ${esc(r.defender)}</small><span class="t">${fmtDur(ends - now())}</span></div>` }),
+        }));
+      }
+    }
+    drawDrops();
+  }
+
+  function tickTimers() {
+    for (const el of $$(".timer-tag[data-ends]")) {
+      const t = el.querySelector(".t");
+      if (t) t.textContent = fmtDur(+el.dataset.ends - now());
+    }
+    for (const el of $$("[data-countdown]")) el.textContent = fmtDur(+el.dataset.countdown - now());
+    updateWarPill();
+  }
+
+  function configuredWarSystems() {
+    // Bundled adapter is loaded before app.js, but preserve old exports if unavailable.
+    return window.NodesWarSystems?.resolve(S.live, S.warSystems) || {};
+  }
+
+  function keyPointLocation(b) {
+    const obj = b.location || b.stronghold || b.keyPoint || b.position || b.core || {};
+    const x = Number(b.x ?? b.fx ?? b.blockX ?? (Array.isArray(obj) ? obj[0] : obj.x));
+    const z = Number(b.z ?? b.fz ?? b.blockZ ?? (Array.isArray(obj) ? obj[1] : obj.z));
+    return Number.isFinite(x) && Number.isFinite(z) ? { x, z } : null;
+  }
+
+  function drawKeyPoints() {
+    G.keyPoints.clearLayers();
+    if (!prefs.layers.keyPoints || !window.NodesWarSystems) return;
+    const system = configuredWarSystems().keyPointWars;
+    if (!system?.enabled) return;
+    for (const b of system.battles) {
+      const at = keyPointLocation(b);
+      if (!at) continue;
+      const name = esc(b.name ?? b.keypointName ?? b.keyPointName ?? b.strongholdName ?? 'Stronghold');
+      const attacker = esc(b.attacker ?? b.attackingNation ?? 'Attackers');
+      const defender = esc(b.defender ?? b.defendingNation ?? 'Defenders');
+      const phase = esc(b.status ?? b.phase ?? 'Pending');
+      const marker = L.marker(ll(at.x, at.z), {
+        icon: L.divIcon({ className: '', html: '<div class="war-keypoint-pin" aria-label="Key-point battle">⚔</div>', iconSize: [30, 30], iconAnchor: [15, 15] }),
+        pane: 'flags',
+      });
+      marker.bindTooltip(`<b>${name}</b><br>${attacker} vs ${defender}<br>${phase}`, { className: 'nm-tip', direction: 'top' });
+      marker.on('click', () => openTab('war'));
+      G.keyPoints.addLayer(marker);
+    }
+  }
+
+  function renderWar() {
+    const live = S.live || {};
+    const systems = configuredWarSystems();
+    if (!systems.flagWar) return;
+    const war = live.war || {};
+    const flag = systems.flagWar;
+    const zones = systems.warzones;
+    const raids = systems.raids;
+    const nodeWars = systems.nodesWar;
+    const points = systems.keyPointWars;
+    const atk = flag.enabled ? flag.battles : [];
+    const drop = live.supplyDrop;
+    let h = '';
+
+    const section = (title, active, body) => `<div class="war-system"><h3>${esc(title)} <span class="badge ${active ? 'war' : 'gold'}">${active ? 'Active' : 'Enabled'}</span></h3>${body}</div>`;
+    if (flag.enabled) {
+      let html = `<div class="s">${war.enabled ? `Global war active${war.endsAt ? ` · ends in <b data-countdown="${Number(war.endsAt)}">${fmtDur(Number(war.endsAt) - now())}</b>` : ''}` : 'No global flag war running'}</div>`;
+      html += `<h4>Flags in progress (${atk.length})</h4>`;
+      if (!atk.length) html += '<div class="empty">No active flag attacks.</div>';
+      for (const a of atk.slice().sort((x, y) => Number(y.progress || 0) - Number(x.progress || 0))) {
+        const terr = S.terr.get(S.chunkTerr.get(NodesGeom.key(a.cx, a.cz)));
+        const owner = terr && S.owner.get(terr.id);
+        const progress = Math.max(0, Math.min(1, Number(a.progress) || 0));
+        const pos = Number.isFinite(+a.fx) && Number.isFinite(+a.fz) ? ` data-fly="${+a.fx},${+a.fz}"` : '';
+        html += `<div class="card"${pos}><div class="t"><span>${esc(a.town)} → ${esc(owner ? owner.name : 'unclaimed')}</span><span>${Math.round(progress * 100)}%</span></div><div class="s">${esc(terr ? terr.name || 'Territory ' + terr.id : '')} · ${esc(a.attacker || '')}</div><div class="bar"><i style="width:${progress * 100}%;background:var(--war)"></i></div></div>`;
+      }
+      h += section('Flag War', flag.active, html);
+    }
+    if (nodeWars.enabled) {
+      let html = '';
+      if (!nodeWars.battles.length) html = '<div class="empty">No NodesWar battles currently recorded.</div>';
+      for (const b of nodeWars.battles) {
+        const phase = String(b.status || b.phase || 'Active');
+        const territory = b.territory ?? b.territoryId;
+        const clickable = Number.isSafeInteger(Number(territory)) ? ` data-terr="${Number(territory)}"` : '';
+        const ends = Number(b.endsAt || b.endAt || 0);
+        html += `<div class="card"${clickable}><div class="t"><span>${esc(b.attacker || b.attackingNation || 'Attackers')} → ${esc(b.defender || b.defendingNation || 'Defenders')}</span><span class="badge ${/live|active/i.test(phase) ? 'war' : 'gold'}">${esc(phase)}</span></div><div class="s">${esc(b.name || b.battleName || (territory != null ? 'Territory ' + territory : 'Conquest battle'))}${ends > 0 ? ` · <span data-countdown="${ends}">${fmtDur(ends - now())}</span>` : ''}</div></div>`;
+      }
+      h += section('NodesWar', nodeWars.active, html);
+    }
+    if (points.enabled) {
+      let html = '<div class="s">Stronghold defence · one life per battle · defeated fighters receive war sickness and cannot rejoin. No automatic land capture.</div>';
+      if (!points.battles.length) html += '<div class="empty">No key-point battles currently recorded.</div>';
+      for (const b of points.battles) {
+        const at = keyPointLocation(b);
+        const loc = at ? ` data-fly="${at.x},${at.z}"` : '';
+        const phase = String(b.status || b.phase || 'Pending');
+        const dead = Array.isArray(b.eliminated) ? b.eliminated.length : Array.isArray(b.deadPlayers) ? b.deadPlayers.length : Number(b.eliminatedCount ?? b.deaths ?? 0);
+        const ends = Number(b.endsAt || b.endAt || 0);
+        const side = `${b.attacker || b.attackingNation || 'Attackers'} vs ${b.defender || b.defendingNation || 'Defenders'}`;
+        html += `<div class="card"${loc}><div class="t"><span>${esc(b.name || b.keyPointName || b.strongholdName || 'Key point')}</span><span class="badge ${/live|active|ongoing/i.test(phase) ? 'war' : 'gold'}">${esc(phase)}</span></div><div class="s">${esc(side)} · ${esc(b.type || b.strongholdType || 'Stronghold')}${Number.isFinite(dead) && dead > 0 ? ` · ${dead} eliminated` : ''}${ends > 0 ? ` · <span data-countdown="${ends}">${fmtDur(ends - now())}</span>` : ''}</div>${b.winner ? `<div class="s">Winner: ${esc(b.winner)} · Peace terms handled by staff</div>` : ''}</div>`;
+      }
+      h += section('Key-point Wars', points.active, html);
+    }
+    if (zones.enabled) {
+      let html = '';
+      if (!zones.battles.length) html = '<div class="empty">No warzone is running.</div>';
+      for (const z of zones.battles) {
+        const scores = Object.entries(z.scores || {}).sort((a, b) => b[1] - a[1]).slice(0, 6);
+        const end = Number(z.endsAt || 0);
+        html += `<div class="card" data-town-fly="${esc(z.town)}"><div class="t"><span>${esc(z.town)}</span>${end ? `<span data-countdown="${end}">${fmtDur(end - now())}</span>` : ''}</div><div class="s">Holding: <b>${esc(z.holder || 'nobody')}</b></div>${scores.length ? `<div class="score">${scores.map(([n, ms]) => `<span>${esc(n)}</span><span>${fmtLong(ms)}</span>`).join('')}</div>` : ''}</div>`;
+      }
+      h += section('Warzones', zones.active, html);
+    }
+    if (raids.enabled) {
+      let html = '';
+      if (!raids.battles.length) html = '<div class="empty">No raids.</div>';
+      for (const r of raids.battles) {
+        const t = S.terr.get(r.territory);
+        const ends = Number(r.phase === 'LIVE' ? r.liveEndsAt : r.prepEndsAt) || 0;
+        const id = Number(r.territory);
+        html += `<div class="card"${Number.isSafeInteger(id) ? ` data-terr="${id}"` : ''}><div class="t"><span>${esc(r.attacker)} → ${esc(r.defender)}</span><span class="badge ${r.phase === 'LIVE' ? 'war' : 'gold'}">${esc(r.phase)}</span></div><div class="s">${esc(t ? t.name || 'Territory ' + t.id : '')}${ends ? ` · <span data-countdown="${ends}">${fmtDur(ends - now())}</span>` : ''}</div></div>`;
+      }
+      h += section('Raids', raids.active, html);
+    }
+    if (!h) h = '<div class="empty">All war systems are disabled in the server configuration.</div>';
+    // The supply drop is a separate live event, never a war system.
+    if (drop && flag.enabled) {
+      h += '<h3>Supply drop</h3>';
+      if (drop.active) {
+        const d = drop.active, end = Number(d.landed ? d.expiresAt : d.landsAt) || 0;
+        const pos = Number.isFinite(+d.x) && Number.isFinite(+d.z) ? ` data-fly="${+d.x},${+d.z}"` : '';
+        h += `<div class="card"${pos}><div class="t"><span>Drop ${d.landed ? 'landed' : 'incoming'}</span><span class="badge gold">${esc(d.id)}</span></div><div class="s">${d.landed ? 'Expires in' : 'Lands in'} <span data-countdown="${end}">${end ? fmtDur(end - now()) : '—'}</span></div></div>`;
+      }
+    }
+    if (flag.enabled) {
+      const occByTown = new Map();
+      for (const t of S.towns.values()) if (t.captured?.length) occByTown.set(t.name, t.captured.length);
+      if (occByTown.size) {
+        h += '<h3>Occupied territories</h3><div class="list">';
+        for (const [name, count] of [...occByTown].sort((a, b) => b[1] - a[1])) {
+          const town = S.towns.get(name);
+          h += `<div class="row" data-town="${esc(name)}"><span class="sw" style="background:${/^#[0-9a-f]{6}$/i.test(town.color) ? town.color : 'var(--war)'}"></span><span class="nm">${esc(name)}</span><span class="stat">${count}</span></div>`;
+        }
+        h += '</div>';
+      }
+    }
+    $('#war-panel').innerHTML = h;
+    const stats = window.NodesWarSystems.counts(systems);
+    $('#war-sec').classList.toggle('on', stats.active > 0);
+    $('#war-sum').textContent = stats.enabled ? `${stats.active} active · ${stats.enabled} enabled` : 'disabled';
+    updateWarPill();
+  }
+
+  function updateWarPill() {
+    const pill = $('#war-pill');
+    if (!window.NodesWarSystems) { pill.hidden = true; return; }
+    const stats = window.NodesWarSystems.counts(configuredWarSystems());
+    pill.hidden = stats.active === 0;
+    pill.textContent = stats.active > 0 ? `⚔ ${stats.active} active war ${stats.active === 1 ? 'system' : 'systems'}` : '';
+  }
+
+  // ---------------------------------------------------------------- sidebar lists
+  const navOpen = new Set(store.get("navOpen", []));
+  function renderLists() {
+    const f = ($('.filter[data-list="all"]').value || "").toLowerCase();
+    const sort = $('.sort[data-list="all"]').value;
+    const on = new Map([...S.towns.values()].map((t) => [t.name, onlineCount(t)]));
+    const townSort = {
+      territories: (a, b) => b.territories.length - a.territories.length,
+      towns: (a, b) => b.territories.length - a.territories.length,
+      residents: (a, b) => b.residents.length - a.residents.length,
+      online: (a, b) => on.get(b.name) - on.get(a.name) || b.territories.length - a.territories.length,
+      name: (a, b) => a.name.localeCompare(b.name),
+    }[sort];
+    const townRow = (t) => `<div class="row town-row" data-town="${esc(t.name)}"><span class="sw" style="background:${t.color}"></span><div class="nm">${esc(prettyName(t.name))}${on.get(t.name) ? ` <span class="tag-online">· ${on.get(t.name)} online</span>` : ""}</div><span class="stat">${t.territories.length} terr · ${t.residents.length} res</span></div>`;
+    const nationOn = (n) => n.townList.reduce((a, t) => a + (on.get(t.name) || 0), 0);
+    const groups = [];
+    for (const n of S.nations.values()) {
+      const all = n.townList.slice();
+      const nameHit = !f || n.name.toLowerCase().includes(f);
+      const towns = (nameHit ? all : all.filter((t) => t.name.toLowerCase().includes(f))).sort(townSort);
+      if (!nameHit && !towns.length) continue;
+      groups.push({ n, towns });
+    }
+    const nsort = {
+      territories: (a, b) => b.n.territories - a.n.territories,
+      towns: (a, b) => b.n.townList.length - a.n.townList.length,
+      residents: (a, b) => b.n.residents - a.n.residents,
+      online: (a, b) => nationOn(b.n) - nationOn(a.n) || b.n.territories - a.n.territories,
+      name: (a, b) => a.n.name.localeCompare(b.n.name),
+    }[sort];
+    groups.sort(nsort);
+    const lone = [...S.towns.values()].filter((t) => !t.nation && (!f || t.name.toLowerCase().includes(f))).sort(townSort);
+    let h = "";
+    for (const { n, towns } of groups) {
+      const open = !!f || navOpen.has(n.name);
+      const online = nationOn(n);
+      h += `<div class="row nation-row ${open ? "open" : ""}" data-nation="${esc(n.name)}"><span class="sw" style="background:${n.color}"></span><div><div class="nm">${esc(prettyName(n.name))}</div><div class="sub">${n.townList.length} town${n.townList.length === 1 ? "" : "s"} · ${n.territories} terr${online ? ` · <span class="tag-online">${online} online</span>` : ""}</div></div><span class="stat">${n.residents} res</span><button class="twist" data-twist="${esc(n.name)}" aria-label="Show towns" title="Show towns"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button></div>`;
+      if (open) h += towns.map(townRow).join("");
+    }
+    if (lone.length) h += `<h3>No nation</h3>` + lone.map(townRow).join("");
+    $("#list-tree").innerHTML = h || `<div class="empty">Nothing matches.</div>`;
+  }
+
+  // ---------------------------------------------------------------- info panels
+  let infoTarget = null;
+  // sections remember whether you folded them; long lists start folded
+  const infoFolded = new Set(store.get("infoFolded", ["Residents", "Towns"]));
+  function sectionize(root) {
+    for (const h of [...root.querySelectorAll(".section-h")]) {
+      const title = h.textContent.trim();
+      const det = document.createElement("details");
+      det.className = "sec-d";
+      det.open = !infoFolded.has(title);
+      const sum = document.createElement("summary");
+      sum.textContent = title;
+      det.appendChild(sum);
+      let n = h.nextSibling;
+      h.parentNode.insertBefore(det, h);
+      while (n && !(n.nodeType === 1 && n.classList.contains("section-h"))) {
+        const next = n.nextSibling;
+        det.appendChild(n);
+        n = next;
+      }
+      h.remove();
+      det.addEventListener("toggle", () => {
+        if (det.open) infoFolded.delete(title); else infoFolded.add(title);
+        store.set("infoFolded", [...infoFolded]);
+      });
+    }
+  }
+  function openInfo(html, target) {
+    infoTarget = target;
+    $("#info-body").innerHTML = html;
+    sectionize($("#info-body"));
+    $("#info").hidden = false;
+  }
+  function refreshInfo() {
+    if (!infoTarget || $("#info").hidden) return;
+    const [k, v] = infoTarget;
+    if (k === "terr") showTerritory(v, false);
+    if (k === "town") showTown(v, false);
+    if (k === "nation") showNation(v, false);
+  }
+  const townChip = (name) => {
+    const t = S.towns.get(name);
+    return `<span class="chip" data-town="${esc(name)}"><span class="dot" style="background:${t ? t.color : "#777"}"></span>${esc(prettyName(name))}</span>`;
+  };
+  const nationChip = (name) => {
+    const n = S.nations.get(name);
+    return `<span class="chip" data-nation="${esc(name)}"><span class="dot" style="background:${n ? n.color : "#777"}"></span>${esc(prettyName(name))}</span>`;
+  };
+
+  function showTerritory(id, fly = false) {
+    const t = S.terr.get(id);
+    if (!t) return;
+    const town = S.owner.get(id), occ = S.occupier.get(id);
+    const live = S.live || {};
+    const raid = (live.raids || []).find((r) => r.territory === id);
+    const fort = S.state?.forts?.[id];
+    const zone = town && (live.warzones || []).find((z) => z.town === town.name && z.enabled);
+    const flags = (live.attacks || []).filter((a) => S.chunkTerr.get(NodesGeom.key(a.cx, a.cz)) === id);
+    const occChunks = (live.occupied || []).filter(([x, z]) => S.chunkTerr.get(NodesGeom.key(x, z)) === id).length;
+    const badges = [];
+    if (town && town.home === id) badges.push(`<span class="badge gold">Town home</span>`);
+    if (occ && occ !== town) badges.push(`<span class="badge war">Occupied by ${esc(occ.name)}</span>`);
+    if (raid) badges.push(`<span class="badge war">Raid ${esc(raid.phase.toLowerCase())}</span>`);
+    if (zone) badges.push(`<span class="badge gold">Warzone</span>`);
+    if (fort) badges.push(`<span class="badge">Fort level ${fort}</span>`);
+    if (town && town.supplied) badges.push(supplyCut(id, town) ? `<span class="badge war">Supply cut</span>` : `<span class="badge ok">Supplied</span>`);
+    if (t.wild) badges.push(`<span class="badge">Borders wilderness</span>`);
+    if (t.atk && t.atk !== 1) badges.push(`<span class="badge ${t.atk > 1 ? "ok" : "war"}" title="Flag attacks here take ${+t.atk.toFixed(2)}× as long">${t.atk > 1 ? "Fortified" : "Weak"}: capture ×${+t.atk.toFixed(2)}</span>`);
+    const res = t.resources.map((r) => { const u = resIconUrl(r); return `<div class="res" data-tipres="${esc(r)}">${u ? `<img src="${esc(u)}" alt="">` : ""}${esc(prettyName(r))}</div>`; }).join("");
+    openInfo(`
+      <div class="info-kicker">${t.name ? `Territory #${t.id}` : "Territory"}</div>
+      <h2 class="info-title">${t.name ? esc(t.name) : `#${t.id}`}</h2>
+      <div class="info-sub">${town ? `Owned by ${townChip(town.name)}${town.nation ? " " + nationChip(town.nation) : ""}` : "Unclaimed"}</div>
+      ${badges.length ? `<div class="badges">${badges.join("")}</div>` : ""}
+      <dl class="kv">
+        <dt>Chunks</dt><dd>${t.chunks.length / 2}</dd>
+        <dt>Claim cost</dt><dd>${t.cost ?? "—"}</dd>
+        <dt>Core</dt><dd>${t.core[0] * 16 + 8}, ${t.core[1] * 16 + 8}</dd>
+        ${flags.length ? `<dt>Flags</dt><dd>${flags.length} in progress</dd>` : ""}
+        ${occChunks ? `<dt>Occupied chunks</dt><dd>${occChunks}</dd>` : ""}
+      </dl>
+      ${res ? `<div class="section-h">Resources</div><div class="res-grid">${res}</div>` : ""}
+    `, ["terr", id]);
+    if (fly) map.flyTo(chunkCenter(t.core[0], t.core[1]), Math.max(map.getZoom(), -1));
+  }
+
+  function showTown(name, fly = false) {
+    const t = S.towns.get(name);
+    if (!t) return;
+    const nation = t.nation && S.nations.get(t.nation);
+    const online = new Set(S.players.map((p) => p.name.toLowerCase()));
+    const isCap = nation && nation.capital === t.name;
+    const live = S.live || {};
+    const zone = (live.warzones || []).find((z) => z.town === t.name);
+    const res = (r) => {
+      const role = r === t.leader ? " ♛" : t.officers.includes(r) ? " ·" : "";
+      return `<span class="chip plain ${online.has(r.toLowerCase()) ? "online" : ""}">${esc(r)}${role}</span>`;
+    };
+    const badges = [];
+    if (isCap) badges.push(`<span class="badge gold">Capital of ${esc(prettyName(nation.name))}</span>`);
+    badges.push(`<span class="badge">${t.open ? "Open to join" : "Invite only"}</span>`);
+    if (t.overlord) badges.push(`<span class="badge">Vassal of ${esc(t.overlord)}</span>`);
+    if (zone) badges.push(`<span class="badge gold">Warzone${zone.enabled ? " · active" : ""}</span>`);
+    if (t.claims && t.claims[0] > t.claims[1]) badges.push(`<span class="badge war">Over claim limit</span>`);
+    if (t.supplied) {
+      const cut = t.territories.filter((id) => !t.supplied.includes(id)).length;
+      if (cut) badges.push(`<span class="badge war">${cut} ${cut === 1 ? "territory" : "territories"} cut off</span>`);
+    }
+    const sortedRes = t.residents.slice().sort((a, b) => (a === t.leader ? -1 : b === t.leader ? 1 : (online.has(b.toLowerCase()) - online.has(a.toLowerCase())) || a.localeCompare(b)));
+    openInfo(`
+      <div class="info-kicker">Town</div>
+      <h2 class="info-title"><span class="sw" style="background:${t.color}"></span>${esc(prettyName(t.name))}</h2>
+      <div class="info-sub">${nation ? nationChip(nation.name) : "No nation"}</div>
+      <div class="badges">${badges.join("")}</div>
+      <dl class="kv">
+        <dt>Leader</dt><dd>${esc(t.leader || "—")}</dd>
+        <dt>Residents</dt><dd>${t.residents.length} (${t.residents.filter((r) => online.has(r.toLowerCase())).length} online)</dd>
+        <dt>Territories</dt><dd>${t.territories.length}</dd>
+        ${t.captured?.length ? `<dt>Occupying</dt><dd>${t.captured.length}</dd>` : ""}
+        ${t.claims ? `<dt>Claims</dt><dd>${t.claims[0]} / ${t.claims[1]}</dd>` : ""}
+      </dl>
+      ${t.allies.length ? `<div class="section-h">Allies</div><div class="chips">${t.allies.map(townChip).join("")}</div>` : ""}
+      ${t.enemies.length ? `<div class="section-h">At war with</div><div class="chips">${t.enemies.map(townChip).join("")}</div>` : ""}
+      ${t.vassals?.length ? `<div class="section-h">Vassals</div><div class="chips">${t.vassals.map(townChip).join("")}</div>` : ""}
+      ${t.outposts?.length ? `<div class="section-h">Outposts</div><div class="chips">${t.outposts.map((o) => `<span class="chip plain" data-fly="${o.x},${o.z}" style="cursor:pointer">${esc(o.name)}</span>`).join("")}</div>` : ""}
+      <div class="section-h">Residents</div><div class="chips">${sortedRes.map(res).join("")}</div>
+    `, ["town", name]);
+    if (fly) {
+      const home = S.terr.get(t.home);
+      if (home) map.flyTo(chunkCenter(home.core[0], home.core[1]), Math.max(map.getZoom(), -2));
+    }
+  }
+
+  function showNation(name, fly = false) {
+    const n = S.nations.get(name);
+    if (!n) return;
+    openInfo(`
+      <div class="info-kicker">Nation</div>
+      <h2 class="info-title"><span class="sw" style="background:${n.color}"></span>${esc(prettyName(n.name))}</h2>
+      <div class="info-sub">Capital ${townChip(n.capital)}</div>
+      <dl class="kv">
+        <dt>Towns</dt><dd>${n.townList.length}</dd>
+        <dt>Territories</dt><dd>${n.territories}</dd>
+        <dt>Residents</dt><dd>${n.residents}</dd>
+      </dl>
+      <div class="section-h">Towns</div><div class="chips">${n.townList.map((t) => townChip(t.name)).join("")}</div>
+      ${n.allies.length ? `<div class="section-h">Allies</div><div class="chips">${n.allies.map(nationChip).join("")}</div>` : ""}
+      ${n.enemies.length ? `<div class="section-h">At war with</div><div class="chips">${n.enemies.map(nationChip).join("")}</div>` : ""}
+    `, ["nation", name]);
+    if (fly) {
+      const cap = S.towns.get(n.capital);
+      const home = cap && S.terr.get(cap.home);
+      if (home) map.flyTo(chunkCenter(home.core[0], home.core[1]), Math.max(Math.min(map.getZoom(), -2), -3));
+    }
+  }
+
+  // ---------------------------------------------------------------- search
+  let searchIndex = [];
+  function buildSearch() {
+    searchIndex = [];
+    for (const t of S.towns.values()) searchIndex.push({ kind: "town", label: prettyName(t.name), color: t.color, go: () => showTown(t.name, true) });
+    for (const n of S.nations.values()) searchIndex.push({ kind: "nation", label: prettyName(n.name), color: n.color, go: () => showNation(n.name, true) });
+    for (const t of S.terr.values()) if (t.name) searchIndex.push({ kind: "territory", label: t.name, go: () => showTerritory(t.id, true) });
+    for (const t of S.towns.values()) for (const r of t.residents) searchIndex.push({ kind: "player", label: r, color: t.color, go: () => goPlayer(r) });
+  }
+  function goPlayer(name) {
+    const p = S.players.find((x) => x.name.toLowerCase() === name.toLowerCase());
+    const town = S.residentTown.get(name.toLowerCase());
+    if (town) showTown(town.name, !p);
+    if (p) map.flyTo(ll(p.x, p.z), Math.max(map.getZoom(), 0));
+  }
+  let srSel = 0, srItems = [];
+  function runSearch(q) {
+    const box = $("#search-results");
+    q = q.trim().toLowerCase().replace(/_/g, " ");
+    if (!q) { box.hidden = true; return; }
+    const coord = q.match(/^(-?\d+)[ ,]+(-?\d+)$/);
+    srItems = [];
+    if (coord) srItems.push({ kind: "coords", label: `Go to ${coord[1]}, ${coord[2]}`, go: () => map.flyTo(ll(+coord[1], +coord[2]), Math.max(map.getZoom(), 0)) });
+    // online players not in any town
+    for (const p of S.players) if (!S.residentTown.has(p.name.toLowerCase()) && p.name.toLowerCase().includes(q)) srItems.push({ kind: "player", label: p.name, go: () => map.flyTo(ll(p.x, p.z), 0) });
+    const starts = [], inc = [];
+    for (const it of searchIndex) {
+      const l = it.label.toLowerCase();
+      if (l.startsWith(q)) starts.push(it); else if (l.includes(q)) inc.push(it);
+    }
+    srItems.push(...starts, ...inc);
+    srItems = srItems.slice(0, 30);
+    srSel = 0;
+    box.innerHTML = srItems.length ? srItems.map((it, i) => `<div class="sr ${i === 0 ? "sel" : ""}" data-i="${i}">${it.color ? `<span class="sw" style="width:10px;height:10px;border-radius:3px;background:${it.color}"></span>` : ""}<span>${esc(it.label)}</span><span class="kind">${it.kind}</span></div>`).join("") : `<div class="empty">Nothing found</div>`;
+    box.hidden = false;
+  }
+  function pickSearch(i) {
+    const it = srItems[i];
+    if (!it) return;
+    it.go();
+    $("#search-results").hidden = true;
+    $("#search").blur();
+    if (window.innerWidth <= 760) setSidebar(false);
+  }
+
+  // ---------------------------------------------------------------- hover + hash
+  function hover(id) {
+    const t = S.terr.get(id);
+    if (!t) return;
+    const town = S.owner.get(id);
+    $("#hover-terr").innerHTML = `${esc(t.name || "Territory #" + t.id)}${town ? " · " + esc(prettyName(town.name)) : ""}<span class="mouse-hint">${town ? "click: town · right-click: territory" : "click: territory"}</span>`;
+  }
+  // territory clicks: O(1) chunk lookup instead of thousands of interactive svg paths
+  // left click: the town that owns the land (or the territory if nobody does); right click / long press: the territory
+  const terrAt = (latlng) => S.chunkTerr.get(NodesGeom.key(Math.floor(latlng.lng) >> 4, Math.floor(latlng.lat) >> 4));
+  map.on("click", (e) => {
+    const id = terrAt(e.latlng);
+    const town = id !== undefined ? S.owner.get(id) : null;
+    if (town) showTown(town.name);
+    else if (id !== undefined) showTerritory(id);
+    else { $("#info").hidden = true; infoTarget = null; }
+  });
+  map.on("contextmenu", (e) => {
+    const id = terrAt(e.latlng);
+    if (id !== undefined) showTerritory(id);
+  });
+  map.on("mousemove", (e) => {
+    const x = Math.floor(e.latlng.lng), z = Math.floor(e.latlng.lat);
+    $("#coords").textContent = `x ${x}  z ${z}`;
+    const id = S.chunkTerr.get(NodesGeom.key(x >> 4, z >> 4));
+    if (id === undefined) $("#hover-terr").textContent = "";
+    else hover(id);
+  });
+
+  function applyHash() {
+    const m = location.hash.match(/^#(-?\d+),(-?\d+),(-?\d+)/);
+    if (!m) return false;
+    map.setView(ll(+m[1], +m[2]), +m[3]);
+    return true;
+  }
+  map.on("moveend", () => {
+    if (!S.fitPending) {
+      const c = map.getCenter();
+      history.replaceState(null, "", `#${Math.round(c.lng)},${Math.round(c.lat)},${map.getZoom()}`);
+    }
+    if (prefs.layers.chunks || prefs.squareGrid) drawChunkGrid();
+  });
+  map.on("zoomend", syncLayerVisibility);
+  map.on("moveend zoomend resize", scheduleLayout);
+  window.addEventListener("hashchange", applyHash);
+
+  // ---------------------------------------------------------------- resource hover cards
+  const RES_KEYS = { income: "Income", ore: "Mining drops", crops: "Crops", animals: "Animals" };
+  function fmtItem(k) { return prettyName(String(k).toLowerCase()); }
+  function resTipHtml(n) {
+    const r = S.resources[n] || {};
+    const u = resIconUrl(n);
+    let count = 0;
+    for (const t of S.terr.values()) if (t.resources.includes(n)) count++;
+    const rows = [];
+    for (const [k, label] of Object.entries(RES_KEYS)) {
+      const v = r[k];
+      if (!v || typeof v !== "object" || !Object.keys(v).length) continue;
+      const items = Object.entries(v).map(([item, amt]) => {
+        const a = Array.isArray(amt) ? `${+(amt[0] * 100).toFixed(2)}% · ${amt[1]}–${amt[2]}` : k === "ore" ? `${+(amt * 100).toFixed(2)}%` : `${amt}`;
+        return `<div><span>${esc(fmtItem(item))}</span><b>${esc(a)}</b></div>`;
+      }).join("");
+      rows.push(`<div class="tip-sec">${label}</div><div class="tip-grid">${items}</div>`);
+    }
+    const extra = [];
+    if (r.attacker_time_multiplier && r.attacker_time_multiplier !== 1) extra.push(`<div><span>Capture time</span><b>×${r.attacker_time_multiplier}</b></div>`);
+    if (r.defender_time_multiplier && r.defender_time_multiplier !== 1) extra.push(`<div><span>Retake time</span><b>×${r.defender_time_multiplier}</b></div>`);
+    if (r.cost && (r.cost.constant || (r.cost.scale && r.cost.scale !== 1))) extra.push(`<div><span>Claim cost</span><b>${r.cost.constant ? "+" + r.cost.constant : ""}${r.cost.scale && r.cost.scale !== 1 ? " ×" + r.cost.scale : ""}</b></div>`);
+    if (extra.length) rows.push(`<div class="tip-sec">Territory</div><div class="tip-grid">${extra.join("")}</div>`);
+    const known = new Set(["icon", "cost", "priority", "income", "ore", "crops", "animals", "attacker_time_multiplier", "defender_time_multiplier"]);
+    const rest = Object.fromEntries(Object.entries(r).filter(([k, v]) => !known.has(k) && !(v && typeof v === "object" && !Object.keys(v).length)));
+    if (Object.keys(rest).length) rows.push(`<div class="tip-sec">Other</div><pre>${esc(JSON.stringify(rest, null, 1))}</pre>`);
+    return `<div class="tip-h">${u ? `<img src="${esc(u)}" alt="">` : ""}<b>${esc(prettyName(n))}</b><span>${count} ${count === 1 ? "territory" : "territories"}</span></div>${rows.join("") || `<div class="tip-none">No extra details</div>`}`;
+  }
+  function setupResTips() {
+    const tip = document.createElement("div");
+    tip.id = "res-tip";
+    tip.hidden = true;
+    document.body.appendChild(tip);
+    let cur = null;
+    const place = (e) => {
+      const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+      let x = e.clientX + pad, y = e.clientY + pad;
+      if (x + w > innerWidth - 8) x = Math.max(8, e.clientX - w - pad);
+      if (y + h > innerHeight - 8) y = Math.max(8, innerHeight - h - 8);
+      tip.style.left = x + "px"; tip.style.top = y + "px";
+    };
+    document.addEventListener("mouseover", (e) => {
+      const el = e.target.closest ? e.target.closest("[data-tipres]") : null;
+      if (el === cur) return;
+      cur = el;
+      if (!el) { tip.hidden = true; return; }
+      tip.innerHTML = resTipHtml(el.dataset.tipres);
+      tip.hidden = false;
+      place(e);
+    });
+    document.addEventListener("mousemove", (e) => { if (cur) place(e); });
+    document.addEventListener("mousedown", () => { tip.hidden = true; cur = null; }, true);
+    map.on("zoomstart movestart", () => { tip.hidden = true; cur = null; });
+  }
+
+  // ---------------------------------------------------------------- layers + modes
+  function syncLayerVisibility() {
+    const z = map.getZoom();
+    const want = {
+      terr: true,
+      borders: prefs.layers.borders && prefs.mode !== "plain",
+      townLabels: true, // layoutLabels decides what fits at each zoom
+      nationLabels: true,
+      terrLabels: true,
+      terrIds: true,
+      resources: prefs.layers.resources && z >= -1,
+      players: prefs.layers.players,
+      occ: prefs.layers.war, flags: prefs.layers.war,
+      zones: prefs.layers.warzones,
+      raids: prefs.layers.raids,
+      keyPoints: prefs.layers.keyPoints,
+      forts: prefs.layers.forts && z >= -1,
+      outposts: prefs.layers.outposts && z >= -1,
+      ports: prefs.layers.ports && z >= -2,
+      towers: prefs.layers.towers && z >= -2,
+      refineries: prefs.layers.refineries && z >= -2,
+      drops: prefs.layers.drops,
+      grid: prefs.layers.chunks || prefs.squareGrid,
+      shards: prefs.layers.shards,
+    };
+    map.getContainer().classList.toggle("far", z < -1);
+    document.body.classList.toggle("zlow", z <= -1);
+    for (const [k, on] of Object.entries(want)) {
+      const has = map.hasLayer(G[k]);
+      if (on && !has) G[k].addTo(map);
+      if (!on && has) map.removeLayer(G[k]);
+    }
+  }
+
+  function setMode(m) {
+    prefs.mode = m; store.set("mode", m);
+    $$("#modes button").forEach((b) => b.classList.toggle("active", b.dataset.mode === m));
+    refreshModeExtra();
+    styleTerritories(); drawBorders(); syncLayerVisibility();
+    syncPanel();
+  }
+
+  function refreshModeExtra() {
+    const el = $("#mode-extra");
+    if (prefs.mode === "diplomacy") {
+      const towns = [...S.towns.keys()].sort((a, b) => a.localeCompare(b));
+      el.innerHTML = `<select id="diplo-town"><option value="">Pick a town…</option>${towns.map((n) => `<option ${n === prefs.diploTown ? "selected" : ""}>${esc(n)}</option>`).join("")}</select>
+        <div class="chips" style="margin-top:8px">${[["#4f8ad9", "Own"], ["#2fb3a6", "Nation"], ["#46a758", "Ally"], ["#9b6bd6", "Vassal"], ["#e5484d", "Enemy"], ["#6b7280", "Neutral"]].map(([c, l]) => `<span class="chip plain"><span class="dot" style="background:${c}"></span>${l}</span>`).join("")}</div>`;
+      $("#diplo-town").onchange = (e) => { prefs.diploTown = e.target.value; store.set("diploTown", prefs.diploTown); styleTerritories(); };
+    } else if (prefs.mode === "resources") {
+      const names = Object.keys(S.resources).sort();
+      const counts = new Map();
+      for (const t of S.terr.values()) for (const r of t.resources) counts.set(r, (counts.get(r) || 0) + 1);
+      el.innerHTML = `<select id="res-pick"><option value="">Pick a resource…</option>${names.map((n) => `<option value="${esc(n)}" ${n === prefs.resource ? "selected" : ""}>${esc(n)} (${counts.get(n) || 0})</option>`).join("")}</select>`;
+      $("#res-pick").onchange = (e) => { prefs.resource = e.target.value; store.set("resource", prefs.resource); styleTerritories(); };
+    } else if (prefs.mode === "supply") {
+      const any = [...S.towns.values()].some((t) => t.supplied);
+      el.innerHTML = any ? `<div class="chips"><span class="chip plain"><span class="dot" style="background:#46a758"></span>Connected to home</span><span class="chip plain"><span class="dot" style="background:#e5484d"></span>Cut off</span></div>` : `<p class="hint">Supply lines are turned off in the Nodes map export config.</p>`;
+    } else {
+      el.innerHTML = "";
+    }
+  }
+
+  // ---------------------------------------------------------------- ui wiring
+  function setWarOpen(open) {
+    prefs.warOpen = open; store.set("warOpen", open);
+    $("#war-sec").classList.toggle("closed", !open);
+    $("#war-head").setAttribute("aria-expanded", String(open));
+  }
+  /** kept for the war pill and map timers: show the war section */
+  function openTab(name) {
+    setSidebar(true);
+    if (name === "war") {
+      setWarOpen(true);
+      $("#war-sec").scrollIntoView({ block: "nearest" });
+    }
+  }
+  function setSidebar(open) {
+    prefs.sidebar = open; store.set("sidebar", open);
+    document.body.classList.toggle("sidebar-closed", !open);
+  }
+
+  function setView(open) {
+    prefs.view = open;
+    $("#view").classList.toggle("open", open);
+    $("#layers-btn").setAttribute("aria-expanded", String(open));
+  }
+
+  // looks: one click sets mode + layers. Anything not listed is switched off.
+  const PRESETS = [
+    ["clean", "Clean", "towns", ["territories", "borders", "townLabels", "nationLabels", "war"]],
+    ["political", "Political", "nations", ["territories", "borders", "townLabels", "nationLabels"]],
+    ["war", "War", "towns", ["territories", "borders", "townLabels", "players", "war", "warzones", "raids", "keyPoints", "forts", "outposts"]],
+    ["economy", "Economy", "towns", ["territories", "borders", "townLabels", "resources", "ports", "towers", "refineries", "drops"]],
+  ];
+  function activePreset() {
+    for (const [id, , mode, on] of PRESETS) {
+      if (prefs.mode !== mode) continue;
+      if (LAYERS.every(([k]) => !!prefs.layers[k] === on.includes(k))) return id;
+    }
+    return null;
+  }
+  function refreshLayers() {
+    styleTerritories(); drawWar(); drawZones(); drawKeyPoints(); drawPlayers(); drawChunkGrid();
+    syncLayerVisibility();
+    scheduleLayout();
+  }
+  function applyPreset(id) {
+    const p = PRESETS.find(([k]) => k === id);
+    if (!p) return;
+    for (const [k] of LAYERS) prefs.layers[k] = p[3].includes(k);
+    store.set("layers", prefs.layers);
+    if (prefs.mode !== p[2]) setMode(p[2]);
+    refreshLayers();
+    syncPanel();
+  }
+  function syncPanel() {
+    const cur = activePreset();
+    $$("#presets button").forEach((b) => b.classList.toggle("active", b.dataset.preset === cur));
+    $$("#layer-toggles input").forEach((i) => {
+      const keys = GROUPS.find(([l]) => l === i.dataset.group)[1];
+      const on = keys.filter((k) => prefs.layers[k]).length;
+      i.checked = on > 0;
+      i.indeterminate = on > 0 && on < keys.length;
+    });
+  }
+
+  function buildUi() {
+    setupResTips();
+    setSidebar(prefs.sidebar);
+    $("#menu-btn").onclick = () => setSidebar(!prefs.sidebar);
+    const fit = $("#fit-territories");
+    if (fit) fit.onclick = fitTerritories;
+    const sqFrame = $("#square-map-toggle"), sqGrid = $("#square-grid-toggle");
+    sqFrame.checked = prefs.squareFrame;
+    sqGrid.checked = prefs.squareGrid;
+    sqFrame.onchange = () => {
+      prefs.squareFrame = sqFrame.checked;
+      store.set("squareFrame", prefs.squareFrame);
+      refreshSquareFrame(); drawChunkGrid();
+      if (prefs.squareFrame && squareBounds) fitTerritories();
+    };
+    sqGrid.onchange = () => {
+      prefs.squareGrid = sqGrid.checked;
+      store.set("squareGrid", prefs.squareGrid);
+      drawChunkGrid(); syncLayerVisibility();
+    };
+    $("#war-head").onclick = () => setWarOpen(!prefs.warOpen);
+    setWarOpen(prefs.warOpen);
+    $("#war-pill").onclick = () => openTab("war");
+    setView(false);
+    $("#layers-btn").onclick = () => setView(!prefs.view);
+    $("#view-close").onclick = () => setView(false);
+    document.addEventListener("mousedown", (e) => {
+      if (prefs.view && !e.target.closest("#view, #layers-btn")) setView(false);
+    });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && prefs.view) setView(false); });
+    for (const el of [$("#view"), $("#sidebar"), $("#info")]) {
+      L.DomEvent.disableClickPropagation(el);
+      L.DomEvent.disableScrollPropagation(el);
+    }
+    $("#info-close").onclick = () => { $("#info").hidden = true; infoTarget = null; };
+
+    $("#modes").innerHTML = MODES.map(([k, l]) => `<button data-mode="${k}" class="${k === prefs.mode ? "active" : ""}">${l}</button>`).join("");
+    $$("#modes button").forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
+
+    if (store.get("layers", null) === null && store.get("mode", null) === null) {
+      for (const [k] of LAYERS) prefs.layers[k] = PRESETS[0][3].includes(k);
+    }
+    $("#presets").innerHTML = PRESETS.map(([k, l]) => `<button data-preset="${k}">${l}</button>`).join("");
+    $$("#presets button").forEach((b) => (b.onclick = () => applyPreset(b.dataset.preset)));
+
+    $("#layer-toggles").innerHTML = GROUPS.map(([l]) => `<label class="tgl"><input type="checkbox" data-group="${l}">${l}</label>`).join("");
+    $$("#layer-toggles input").forEach((i) => (i.onchange = () => {
+      const keys = GROUPS.find(([l]) => l === i.dataset.group)[1];
+      for (const k of keys) prefs.layers[k] = i.checked;
+      store.set("layers", prefs.layers);
+      refreshLayers();
+      syncPanel();
+      i.blur();
+    }));
+    const customOpen = (open) => {
+      $("#layer-toggles").hidden = !open;
+      $("#custom-toggle").setAttribute("aria-expanded", String(open));
+      store.set("customOpen", open);
+    };
+    $("#custom-toggle").onclick = () => customOpen($("#layer-toggles").hidden);
+    customOpen(!!store.get("customOpen", false));
+    syncPanel();
+
+    $$(".filter, .sort").forEach((el) => (el.oninput = renderLists));
+
+    // delegated clicks for chips/rows/cards anywhere in panels
+    document.addEventListener("click", (e) => {
+      const tw = e.target.closest("[data-twist]");
+      if (tw) {
+        const n = tw.dataset.twist;
+        if (navOpen.has(n)) navOpen.delete(n); else navOpen.add(n);
+        store.set("navOpen", [...navOpen]);
+        renderLists();
+        return;
+      }
+      const el = e.target.closest("[data-town],[data-nation],[data-terr],[data-fly],[data-town-fly]");
+      if (!el || !el.closest("#sidebar,#info")) return;
+      if (el.dataset.town) showTown(el.dataset.town, true);
+      else if (el.dataset.nation) showNation(el.dataset.nation, true);
+      else if (el.dataset.terr) showTerritory(+el.dataset.terr, true);
+      else if (el.dataset.townFly) showTown(el.dataset.townFly, true);
+      else if (el.dataset.fly) { const [x, z] = el.dataset.fly.split(",").map(Number); map.flyTo(ll(x, z), Math.max(map.getZoom(), 0)); }
+      if (window.innerWidth <= 760 && el.closest("#sidebar")) setSidebar(false);
+    });
+
+    const s = $("#search");
+    s.addEventListener("input", () => runSearch(s.value));
+    s.addEventListener("focus", () => s.value && runSearch(s.value));
+    s.addEventListener("keydown", (e) => {
+      const items = $$("#search-results .sr");
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        srSel = (srSel + (e.key === "ArrowDown" ? 1 : -1) + items.length) % Math.max(items.length, 1);
+        items.forEach((el, i) => el.classList.toggle("sel", i === srSel));
+      } else if (e.key === "Enter") pickSearch(srSel);
+      else if (e.key === "Escape") { $("#search-results").hidden = true; s.blur(); }
+    });
+    $("#search-results").addEventListener("mousedown", (e) => {
+      const el = e.target.closest(".sr");
+      if (el) { e.preventDefault(); pickSearch(+el.dataset.i); }
+    });
+    s.addEventListener("blur", () => setTimeout(() => ($("#search-results").hidden = true), 120));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "/" && document.activeElement !== s) { e.preventDefault(); s.focus(); }
+    });
+    refreshModeExtra();
+  }
+
+  init().catch((e) => {
+    console.error(e);
+    document.body.insertAdjacentHTML("beforeend", `<div style="position:absolute;inset:auto 0 60px 0;text-align:center;color:#ffb3b5;z-index:2000">Could not load the map: ${esc(e.message)}</div>`);
+  });
+})();

@@ -1,0 +1,26 @@
+{
+  "battles": [
+    {
+      "id": "mountain-keep-01",
+      "name": "Mountain Keep",
+      "type": "Fortress",
+      "attacker": "Northern Realm",
+      "defender": "Southern Realm",
+      "status": "LIVE",
+      "x": 1024,
+      "z": -512,
+      "eliminated": ["sample_player_1"]
+    },
+    {
+      "id": "citadel-02",
+      "name": "Old Citadel",
+      "type": "Castle",
+      "attacker": "Eastern Alliance",
+      "defender": "Western Alliance",
+      "status": "PENDING",
+      "x": -640,
+      "z": 768,
+      "eliminated": []
+    }
+  ]
+}
