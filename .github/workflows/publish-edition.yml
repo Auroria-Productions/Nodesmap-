@@ -70,6 +70,37 @@ jobs:
           echo "jar=$jar" >> "$GITHUB_OUTPUT"
           echo "source=$source" >> "$GITHUB_OUTPUT"
 
+      - name: Import readable edition source into branch
+        if: steps.edition.outputs.ready == 'true'
+        shell: bash
+        env:
+          SOURCE: ${{ steps.edition.outputs.source }}
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          unzip -q "$SOURCE" -d "$staging"
+          src="$(find "$staging" -type d -name milzzynodesmap -print -quit)"
+          if [[ -z "$src" ]]; then echo "::error::Missing milzzynodesmap source directory"; exit 1; fi
+          mkdir -p milzzynodesmap
+          for folder in src web tools checks examples; do
+            if [[ -d "$src/$folder" ]]; then
+              mkdir -p "milzzynodesmap/$folder"
+              cp -R "$src/$folder/." "milzzynodesmap/$folder/"
+            fi
+          done
+          for file in README.md WAR-VIEWER-CHANGELOG.md rebuild.sh; do
+            if [[ -f "$src/$file" ]]; then cp "$src/$file" "milzzynodesmap/$file"; fi
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add milzzynodesmap/
+          if ! git diff --cached --quiet; then
+            git commit -m "Import verified $GITHUB_REF_NAME map source"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+          echo "Readable source imported; vendored binary dependencies remain in source ZIP"
+
       - name: Publish matching JAR and source ZIP
         if: steps.edition.outputs.ready == 'true'
         shell: bash
@@ -82,7 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --target "$GITHUB_SHA" --title "$LABEL" --notes "Download the matching JAR and source ZIP below. Install one map edition at a time. Requires a compatible MilzzyNodes core, Paper 1.21.x and Java 21. Back up your map data before replacing the map JAR. The source is a patch-build distribution and includes the historical upstream compiled base used to reproduce this edition."
+            gh release create "$TAG" --target "$(git rev-parse HEAD)" --title "$LABEL" --notes "Download the matching JAR and source ZIP below. Install one map edition at a time. Requires a compatible MilzzyNodes core, Paper 1.21.x and Java 21. Back up your map data before replacing the map JAR. The source is a patch-build distribution and includes the historical upstream compiled base used to reproduce this edition."
           fi
           gh release upload "$TAG" "$JAR" "$SOURCE" --clobber
           gh release view "$TAG" --json tagName,assets --jq '{tag:.tagName,assets:[.assets[].name]}'
