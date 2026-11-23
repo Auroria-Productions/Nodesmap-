@@ -24,6 +24,43 @@ jobs:
       - name: Checkout selected branch
         uses: actions/checkout@v4
 
+      - name: Reconstruct and checksum exact source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          case "$GITHUB_REF_NAME" in
+            main)
+              parts=(release-inputs/parts/standard-source.part*)
+              count=21
+              archive="release-inputs/MilzzyNodesMap-0.3.8-Standard-Source.zip"
+              expected_source="2fe78560f1a295454cd4f01dbd9e84691d97b9f4ddad4949037057f645d7edc8"
+              jar="release-inputs/MilzzyNodesMap-0.3.8-Standard.jar"
+              expected_jar="a5ada159a8095a964bc4e9742e7b67c43a7700938404262043acfb2b4d68f940"
+              ;;
+            square-map)
+              parts=(release-inputs/parts/square-source.part*)
+              count=22
+              archive="release-inputs/MilzzyNodesMap-0.3.9-Square-Source.zip"
+              expected_source="6ad56c289bf856179bb4cd403a698d6d5d24876c4769a6631bde268f9b3f8498"
+              jar="release-inputs/MilzzyNodesMap-0.3.9-Square.jar"
+              expected_jar="2d4a0767efe9368cbd17064391305d6e7ac2038aaf3f92840b9846385efdc0a7"
+              ;;
+            *) echo "::error::Unknown branch"; exit 1 ;;
+          esac
+          if (( ${#parts[@]} != count )); then
+            echo "::error::Expected $count source segments, got ${#parts[@]}"; exit 1
+          fi
+          for ((i=0; i<count; i++)); do
+            if [[ ! -s "${parts[i]}" ]]; then
+              echo "::error::Missing source part number $i"; exit 1
+            fi
+          done
+          cat "${parts[@]}" > "$archive"
+          printf '%s  %s\n' "$expected_source" "$archive" | sha256sum --check
+          printf '%s  %s\n' "$expected_jar" "$jar" | sha256sum --check
+          echo "Recovered byte-identical source archive and JAR for $GITHUB_REF_NAME"
+
       - name: Verify exact edition assets
         id: edition
         shell: bash
